@@ -62,6 +62,51 @@ from utils import base_url_host_matches
 logger = logging.getLogger("run_agent")
 
 
+def _normalize_allowed_tool_names(raw: Any) -> Optional[frozenset[str]]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return frozenset({raw.strip()}) if raw.strip() else frozenset()
+    try:
+        return frozenset(
+            str(name).strip()
+            for name in raw
+            if str(name).strip()
+        )
+    except TypeError:
+        text = str(raw).strip()
+        return frozenset({text}) if text else frozenset()
+
+
+def _policy_allows_tool(agent, tool_name: str) -> bool:
+    """Whether ``tool_name`` should be exposed in the schema under policy.
+
+    This gates late-injected tools (memory-provider, context-engine) the same
+    way :meth:`PermissionContext.filter_tool_names` gates the main registry
+    path: keep tools the policy allows outright *and* tools gated behind owner
+    approval (``ask_owner``). ask_owner tools must stay in the schema so the
+    model can call them and trigger the durable approval path; the executor
+    intercepts the call. (denied tools are dropped.)
+    """
+    if not tool_name:
+        return False
+    ctx = getattr(agent, "tool_policy_context", None)
+    if ctx is not None and hasattr(ctx, "tool_decision"):
+        try:
+            return ctx.tool_decision(tool_name) in ("allow", "ask_owner")
+        except Exception:
+            return False
+    if ctx is not None and hasattr(ctx, "allows_tool_name"):
+        try:
+            return bool(ctx.allows_tool_name(tool_name))
+        except Exception:
+            return False
+    allowed = getattr(agent, "allowed_tool_names", None)
+    if allowed is None:
+        return True
+    return tool_name in allowed
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -203,6 +248,10 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    allowed_tool_names: List[str] | None = None,
+    tool_policy_context: Any = None,
+    session_user_id: str | None = None,
+    session_search_user_id: str | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -273,6 +322,10 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    agent.tool_policy_context = tool_policy_context
+    agent.allowed_tool_names = _normalize_allowed_tool_names(allowed_tool_names)
+    agent._session_user_id = session_user_id
+    agent._session_search_user_id = session_search_user_id
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -906,12 +959,72 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # Get available tools with filtering
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    # Get available tools with filtering.  Owner/correspondent policy runs as
+    # a final tool-name allowlist before dynamic schemas are rebuilt, so tools
+    # like execute_code do not mention or proxy denied tools.
+    if (
+        tool_policy_context is not None
+        and getattr(tool_policy_context, "mcp_visibility_active", False)
+    ):
+        try:
+            from tools.mcp_tool import discover_mcp_tools
+
+            discover_mcp_tools(permission_context=tool_policy_context)
+        except Exception as _mcp_policy_err:
+            logger.warning("Policy-scoped MCP discovery failed: %s", _mcp_policy_err)
+
+    # Bind the policy context while tool schemas are collected. MCP check_fns
+    # resolve their physical cache key from the *current* permission context;
+    # policy-scoped clients were registered under scoped keys by
+    # discover_mcp_tools() above, so without the context bound here the checks
+    # look up the unscoped key, fail, and even allowed scoped MCP tools get
+    # filtered out of the candidate/final tool lists.
+    _policy_context_token = None
+    if tool_policy_context is not None:
+        try:
+            from gateway.permissions import set_current_permission_context
+
+            _policy_context_token = set_current_permission_context(tool_policy_context)
+        except Exception as _bind_err:
+            logger.debug("Could not bind tool policy context for tool discovery: %s", _bind_err)
+    try:
+        _allowed_tool_names = agent.allowed_tool_names
+        if _allowed_tool_names is None and tool_policy_context is not None:
+            try:
+                _candidate_tools = _ra().get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=agent.quiet_mode,
+                )
+                _candidate_names = {
+                    tool.get("function", {}).get("name")
+                    for tool in _candidate_tools
+                    if isinstance(tool, dict)
+                }
+                _allowed_tool_names = frozenset(
+                    tool_policy_context.filter_tool_names(
+                        name for name in _candidate_names if name
+                    )
+                )
+            except Exception as _policy_err:
+                logger.warning("Tool policy resolution failed; hiding all tools: %s", _policy_err)
+                _allowed_tool_names = frozenset()
+            agent.allowed_tool_names = _allowed_tool_names
+
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+            allowed_tool_names=_allowed_tool_names,
+        )
+    finally:
+        if _policy_context_token is not None:
+            try:
+                from gateway.permissions import reset_current_permission_context
+
+                reset_current_permission_context(_policy_context_token)
+            except Exception:
+                pass
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1078,9 +1191,22 @@ def init_agent(
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
+                _mem_kwargs: Dict[str, Any] = {}
+                _policy_ctx = getattr(agent, "tool_policy_context", None)
+                if _policy_ctx is not None:
+                    try:
+                        _mem_kwargs = {
+                            "user_namespace": getattr(getattr(_policy_ctx, "requester", None), "key", None),
+                            "owner_namespace": getattr(_policy_ctx, "subject_owner_id", None),
+                            "shared_namespace": getattr(_policy_ctx, "subject_owner_id", None),
+                            "use_owner_memory": bool(getattr(_policy_ctx, "is_owner", False)),
+                        }
+                    except Exception:
+                        _mem_kwargs = {}
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    **_mem_kwargs,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1180,6 +1306,8 @@ def init_agent(
             _tname = _schema.get("name", "")
             if _tname and _tname in _existing_tool_names:
                 continue  # already registered via plugin path
+            if _tname and not _policy_allows_tool(agent, _tname):
+                continue
             _wrapped = {"type": "function", "function": _schema}
             agent.tools.append(_wrapped)
             if _tname:
@@ -1506,6 +1634,8 @@ def init_agent(
             _tname = _schema.get("name", "")
             if _tname and _tname in _existing_tool_names:
                 continue  # already registered via plugin/cache path
+            if _tname and not _policy_allows_tool(agent, _tname):
+                continue
             _wrapped = {"type": "function", "function": _schema}
             agent.tools.append(_wrapped)
             if _tname:

@@ -20,12 +20,21 @@ DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 
 
 def _normalize_channel_query(value: str) -> str:
-    return value.lstrip("#").strip().lower()
+    # Strip the leading sigils used in target labels (#channel, @bot) so the
+    # natural shorthand resolves. Applied symmetrically to the query and to
+    # stored names, so equality stays consistent across platforms. Slack bot
+    # peers are listed as "@name (bot ...)" — without dropping "@", the
+    # shorthand "slack:@peerbot" would never match the stored "peerbot".
+    return value.strip().lstrip("#@").strip().lower()
 
 
 def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     """Return the human-facing target label shown to users for a channel entry."""
     name = channel["name"]
+    if platform_name == "slack" and channel.get("type") == "bot":
+        owner = channel.get("owner_label")
+        suffix = f"bot for {owner}" if owner else "bot"
+        return f"@{name.lstrip('@')} ({suffix})"
     if platform_name == "discord" and channel.get("guild"):
         return f"#{name}"
     if platform_name != "discord" and channel.get("type"):
@@ -204,6 +213,33 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
         if entry.get("id") not in seen_ids:
             channels.append(entry)
             seen_ids.add(entry.get("id"))
+
+    # Merge in Slack bot users discovered from users.list, mentions, and
+    # inbound bot DMs.  These resolve to U... IDs; Slack chat.postMessage can
+    # address those directly for bot-to-bot DMs.
+    try:
+        from gateway.slack_bot_directory import known_slack_bot_agents
+
+        self_bot_ids = set(getattr(adapter, "_team_bot_user_ids", {}).values())
+        for team_id in team_clients:
+            for bot in known_slack_bot_agents(
+                team_id=team_id,
+                exclude_user_ids=self_bot_ids,
+            ):
+                user_id = bot.get("user_id")
+                name = bot.get("name") or bot.get("display_name") or bot.get("real_name") or user_id
+                if not user_id or user_id in seen_ids:
+                    continue
+                channels.append({
+                    "id": user_id,
+                    "name": str(name).lstrip("@"),
+                    "type": "bot",
+                    "bot_id": bot.get("bot_id", ""),
+                    "owner_label": bot.get("owner_label", ""),
+                })
+                seen_ids.add(user_id)
+    except Exception as e:
+        logger.debug("Channel directory: failed to merge Slack bot directory: %s", e)
 
     return channels
 

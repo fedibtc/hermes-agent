@@ -64,6 +64,11 @@ from .whatsapp_identity import (
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
+from .conversation_policy import (
+    build_communication_mode_prompt_lines,
+    infer_communication_mode,
+    resolve_conversation_policy,
+)
 from utils import atomic_replace
 
 
@@ -87,10 +92,15 @@ class SessionSource:
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
-    is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
+    is_bot: bool = False  # True when the message author is a bot/webhook
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+
+    @property
+    def communication_mode(self) -> str:
+        """Classify the peer relationship for prompt and policy decisions."""
+        return infer_communication_mode(self)
     
     @property
     def description(self) -> str:
@@ -123,6 +133,7 @@ class SessionSource:
             "user_name": self.user_name,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
+            "is_bot": self.is_bot,
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -149,6 +160,7 @@ class SessionSource:
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
+            is_bot=bool(data.get("is_bot", False)),
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
@@ -232,6 +244,7 @@ def build_session_context_prompt(
     context: SessionContext,
     *,
     redact_pii: bool = False,
+    user_config: dict | None = None,
 ) -> str:
     """
     Build the dynamic system prompt section that tells the agent about its context.
@@ -289,6 +302,14 @@ def build_session_context_prompt(
             desc = src.description
         lines.append(f"**Source:** {platform_name} ({desc})")
 
+    policy = resolve_conversation_policy(
+        context.source,
+        user_config=user_config,
+        platform_key=("cli" if context.source.platform == Platform.LOCAL else context.source.platform.value),
+    )
+    if policy.include_mode_prompt:
+        lines.extend(build_communication_mode_prompt_lines(context.source))
+
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
@@ -319,11 +340,14 @@ def build_session_context_prompt(
         lines.append("")
         lines.append(
             "**Platform notes:** You are running inside Slack. "
-            "You do NOT have access to Slack-specific APIs — you cannot search "
+            "You do NOT have direct access to Slack-specific APIs — you cannot search "
             "channel history, pin/unpin messages, manage channels, or list users. "
             "Do not promise to perform these actions. The gateway may inline the "
             "current message's Slack block/attachment payload when available, but "
-            "you still cannot call Slack APIs yourself."
+            "you still cannot call Slack APIs yourself. Peer assistant bots can be "
+            "discovered from Slack mentions and the gateway's workspace user list; "
+            "use send_message(action='list') to find known Slack bot targets such "
+            "as `slack:@peerbot (bot)`."
         )
     elif context.source.platform == Platform.DISCORD:
         # Inject the Discord IDs block only when the agent actually has

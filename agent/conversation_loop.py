@@ -654,7 +654,10 @@ def run_conversation(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            _ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query,
+                permission_context=getattr(agent, "tool_policy_context", None),
+            ) or ""
         except Exception:
             pass
 

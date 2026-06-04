@@ -84,6 +84,19 @@ class MetadataMemoryProvider(FakeMemoryProvider):
         self.memory_writes.append((action, target, content, metadata or {}))
 
 
+class PolicyAwareMemoryProvider(FakeMemoryProvider):
+    """Provider that opts into receiving the gateway permission context."""
+
+    def __init__(self):
+        super().__init__("policy-aware")
+        self.permission_contexts = []
+
+    def prefetch(self, query, *, session_id="", permission_context=None):
+        self.prefetch_queries.append(query)
+        self.permission_contexts.append(permission_context)
+        return self._prefetch_result
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -213,6 +226,23 @@ class TestMemoryManager:
 
         result = mgr.prefetch_all("query")
         assert result == "Has memories"
+
+    def test_prefetch_passes_permission_context_to_opt_in_provider_only(self):
+        mgr = MemoryManager()
+        plain = FakeMemoryProvider("builtin")
+        aware = PolicyAwareMemoryProvider()
+        plain._prefetch_result = "plain"
+        aware._prefetch_result = "aware"
+        permission_context = object()
+        mgr.add_provider(plain)
+        mgr.add_provider(aware)
+
+        result = mgr.prefetch_all("query", permission_context=permission_context)
+
+        assert "plain" in result
+        assert "aware" in result
+        assert plain.prefetch_queries == ["query"]
+        assert aware.permission_contexts == [permission_context]
 
     def test_queue_prefetch_all(self):
         mgr = MemoryManager()

@@ -68,6 +68,22 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    def test_bot_flag_roundtrip_and_communication_mode(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="D123",
+            chat_type="dm",
+            user_id="U999BOT",
+            user_name="peerbot",
+            is_bot=True,
+        )
+        d = source.to_dict()
+        assert d["is_bot"] is True
+
+        restored = SessionSource.from_dict(d)
+        assert restored.is_bot is True
+        assert restored.communication_mode == "bot_to_bot_dm"
+
     def test_chat_id_coerced_to_string(self):
         """from_dict should handle numeric chat_id (common from Telegram)."""
         restored = SessionSource.from_dict({
@@ -97,6 +113,34 @@ class TestSessionSourceRoundtrip:
         """
         with pytest.raises(ValueError):
             SessionSource.from_dict({"platform": "nonexistent", "chat_id": "1"})
+
+
+class TestSessionSourceCommunicationMode:
+    def test_human_dm(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="D1", chat_type="dm")
+        assert source.communication_mode == "human_to_bot_dm"
+
+    def test_bot_dm(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="D1",
+            chat_type="dm",
+            is_bot=True,
+        )
+        assert source.communication_mode == "bot_to_bot_dm"
+
+    def test_human_shared_chat(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="group")
+        assert source.communication_mode == "human_in_shared_chat"
+
+    def test_bot_shared_chat(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            is_bot=True,
+        )
+        assert source.communication_mode == "bot_in_shared_chat"
 
 
 class TestSessionSourceDescription:
@@ -255,6 +299,49 @@ class TestBuildSessionContextPrompt:
         assert "cannot search" in prompt.lower()
         assert "pin" in prompt.lower()
         assert "current message's slack block/attachment payload" in prompt.lower()
+        assert "slack:@peerbot (bot)" in prompt
+
+    def test_human_dm_prompt_marks_human_mode(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="D123",
+            chat_name="Alice",
+            chat_type="dm",
+            user_name="Alice",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Conversation mode:** `human_to_bot_dm`" in prompt
+        assert "Peer type: human in a direct message" in prompt
+        assert "Do not use bot-to-bot `FINAL:` stop markers" in prompt
+
+    def test_bot_dm_prompt_marks_bot_to_bot_mode(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="D123",
+            chat_name="peerbot",
+            chat_type="dm",
+            user_name="peerbot",
+            is_bot=True,
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Conversation mode:** `bot_to_bot_dm`" in prompt
+        assert "Peer type: another assistant or automation bot" in prompt
+        assert "whose interests you represent" in prompt
+        assert "one concise `FINAL:` line" in prompt
 
     def test_discord_prompt_with_channel_topic(self):
         """Channel topic should appear in the session context prompt."""

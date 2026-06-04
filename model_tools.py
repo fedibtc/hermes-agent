@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Iterable, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -265,6 +265,7 @@ def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    allowed_tool_names: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -275,6 +276,9 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        allowed_tool_names: Optional final tool-name allowlist. When provided,
+            schemas outside this set are stripped before dynamic cross-tool
+            schemas are rebuilt.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -287,6 +291,8 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
+    allowed_key = _normalize_tool_name_set(allowed_tool_names)
+
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -298,6 +304,7 @@ def get_tool_definitions(
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
+            allowed_key,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
@@ -312,7 +319,12 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        allowed_tool_names=allowed_key,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -330,6 +342,7 @@ def _compute_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    allowed_tool_names: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -390,6 +403,13 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    allowed_names = _normalize_tool_name_set(allowed_tool_names)
+    if allowed_names is not None:
+        filtered_tools = [
+            t for t in filtered_tools
+            if t.get("function", {}).get("name") in allowed_names
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -482,6 +502,21 @@ def _compute_tool_definitions(
         logger.warning("Schema sanitization skipped: %s", e)
 
     return filtered_tools
+
+
+def _normalize_tool_name_set(raw: Optional[Iterable[str]]) -> Optional[frozenset[str]]:
+    """Normalize an optional tool-name iterable for policy filtering."""
+
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return frozenset({raw.strip()}) if raw.strip() else frozenset()
+    out: set[str] = set()
+    for item in raw:
+        name = str(item).strip()
+        if name:
+            out.add(name)
+    return frozenset(out)
 
 
 # =============================================================================
@@ -746,6 +781,7 @@ def handle_function_call(
     session_id: Optional[str] = None,
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    tool_policy_context: Any = None,
     skip_pre_tool_call_hook: bool = False,
 ) -> str:
     """
@@ -760,6 +796,7 @@ def handle_function_call(
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
+        tool_policy_context: Optional policy context used for denial wording.
 
     Returns:
         Function result as a JSON string.
@@ -767,8 +804,112 @@ def handle_function_call(
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
 
+    _policy_context_token = None
+
+    def _audit_tool(decision: str, **details: Any) -> None:
+        if tool_policy_context is None:
+            return
+        try:
+            from gateway.owner_audit import append_audit_event_for_context
+
+            base_details = {
+                "tool_name": function_name,
+                "decision": decision,
+                "arg_keys": sorted(function_args.keys()) if isinstance(function_args, dict) else [],
+                "task_id": task_id or "",
+                "session_id": session_id or "",
+                "tool_call_id": tool_call_id or "",
+            }
+            base_details.update(details)
+            append_audit_event_for_context(
+                tool_policy_context,
+                "tool_call",
+                details=base_details,
+            )
+        except Exception:
+            pass
+
+    def _maybe_create_owner_approval_for_tool() -> str | None:
+        if tool_policy_context is None:
+            return None
+        try:
+            decision = tool_policy_context.tool_decision(function_name)
+        except Exception:
+            decision = None
+        if decision != "ask_owner":
+            return None
+        if function_name == "send_message":
+            try:
+                from tools.send_message_tool import create_send_message_approval_result
+
+                return create_send_message_approval_result(
+                    function_args,
+                    permission_context=tool_policy_context,
+                )
+            except Exception:
+                logger.debug("Could not create send_message owner approval", exc_info=True)
+                return json.dumps({
+                    "error": "Tool 'send_message' requires owner approval, but the approval request could not be created."
+                }, ensure_ascii=False)
+        return None
+
     try:
+        if enabled_tools is not None:
+            allowed_names = _normalize_tool_name_set(enabled_tools) or frozenset()
+            if function_name not in allowed_names:
+                approval_result = _maybe_create_owner_approval_for_tool()
+                if approval_result is not None:
+                    _audit_tool("ask_owner", reason="owner_approval_required")
+                    return approval_result
+                message = None
+                if tool_policy_context is not None and hasattr(tool_policy_context, "tool_denial_message"):
+                    try:
+                        message = tool_policy_context.tool_denial_message(function_name)
+                    except Exception:
+                        message = None
+                _audit_tool("deny", reason="not_enabled_for_session")
+                return json.dumps({
+                    "error": message or f"Tool '{function_name}' is not enabled for this session."
+                }, ensure_ascii=False)
+
+        if tool_policy_context is not None:
+            try:
+                from gateway.permissions import set_current_permission_context
+
+                _policy_context_token = set_current_permission_context(tool_policy_context)
+            except Exception as _policy_context_err:
+                logger.debug("Could not bind tool policy context: %s", _policy_context_err)
+
+        # Owner-approval interception. ask_owner tools are intentionally kept
+        # in the tool schema (see PermissionContext.filter_tool_names) so the
+        # model can invoke them; divert the call to a durable owner approval
+        # request instead of executing the underlying action. Tools without a
+        # concrete approval builder degrade to an explicit refusal rather than
+        # silently running an owner-gated action. Runs even when the tool is in
+        # the session allowlist (which it now is for ask_owner tools).
+        if tool_policy_context is not None:
+            try:
+                _owner_decision = tool_policy_context.tool_decision(function_name)
+            except Exception:
+                _owner_decision = None
+            if _owner_decision == "ask_owner":
+                approval_result = _maybe_create_owner_approval_for_tool()
+                if approval_result is not None:
+                    _audit_tool("ask_owner", reason="owner_approval_required")
+                    return approval_result
+                message = None
+                if hasattr(tool_policy_context, "tool_denial_message"):
+                    try:
+                        message = tool_policy_context.tool_denial_message(function_name)
+                    except Exception:
+                        message = None
+                _audit_tool("ask_owner", reason="owner_approval_unavailable")
+                return json.dumps({
+                    "error": message or f"Tool '{function_name}' requires owner approval."
+                }, ensure_ascii=False)
+
         if function_name in _AGENT_LOOP_TOOLS:
+            _audit_tool("deny", reason="agent_loop_tool")
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
         # Check plugin hooks for a block directive (unless caller already
@@ -796,6 +937,7 @@ def handle_function_call(
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
+                _audit_tool("deny", reason="pre_tool_call_hook")
                 return json.dumps({"error": block_message}, ensure_ascii=False)
 
         # ACP/Zed edit approval runs before any file mutation.  The requester
@@ -810,6 +952,7 @@ def handle_function_call(
         except Exception as _edit_approval_err:
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
+                _audit_tool("deny", reason="edit_approval_guard_failed")
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
@@ -832,7 +975,7 @@ def handle_function_call(
         if function_name == "execute_code":
             # Prefer the caller-provided list so subagents can't overwrite
             # the parent's tool set via the process-global.
-            sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+            sandbox_enabled = enabled_tools if enabled_tools is not None else (_last_resolved_tool_names or None)
             result = registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
@@ -845,6 +988,7 @@ def handle_function_call(
                 user_task=user_task,
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        _audit_tool("allow", duration_ms=duration_ms)
 
         try:
             from hermes_cli.plugins import invoke_hook
@@ -892,6 +1036,14 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+    finally:
+        if _policy_context_token is not None:
+            try:
+                from gateway.permissions import reset_current_permission_context
+
+                reset_current_permission_context(_policy_context_token)
+            except Exception:
+                pass
 
 
 # =============================================================================

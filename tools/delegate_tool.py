@@ -1103,6 +1103,8 @@ def _build_child_agent(
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
 
+    _parent_allowed_tool_names = getattr(parent_agent, "valid_tool_names", None)
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1134,6 +1136,14 @@ def _build_child_agent(
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
+        allowed_tool_names=(
+            list(_parent_allowed_tool_names)
+            if _parent_allowed_tool_names is not None
+            else None
+        ),
+        tool_policy_context=getattr(parent_agent, "tool_policy_context", None),
+        session_user_id=getattr(parent_agent, "_session_user_id", None),
+        session_search_user_id=getattr(parent_agent, "_session_search_user_id", None),
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren

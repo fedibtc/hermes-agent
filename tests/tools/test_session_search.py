@@ -104,6 +104,217 @@ class TestHiddenSources:
         assert "tool" in _HIDDEN_SESSION_SOURCES
 
 
+class TestRequesterScope:
+    def test_browse_filters_to_requester_user_id(self, db):
+        db.create_session("alice", source="telegram", user_id="telegram:alice")
+        db.append_message("alice", role="user", content="Alice private planning")
+        db.create_session("bob", source="telegram", user_id="telegram:bob")
+        db.append_message("bob", role="user", content="Bob private planning")
+
+        result = json.loads(session_search(db=db, requester_user_id="telegram:alice"))
+
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["alice"]
+
+    def test_discovery_filters_to_requester_user_id(self, db):
+        db.create_session("alice", source="telegram", user_id="telegram:alice")
+        db.append_message("alice", role="user", content="project zephyr budget")
+        db.create_session("bob", source="telegram", user_id="telegram:bob")
+        db.append_message("bob", role="user", content="project zephyr secret")
+
+        result = json.loads(
+            session_search(
+                query="zephyr",
+                db=db,
+                requester_user_id="telegram:alice",
+            )
+        )
+
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["alice"]
+
+    def test_scroll_rejects_other_requester_session(self, db):
+        db.create_session("bob", source="telegram", user_id="telegram:bob")
+        db.append_message("bob", role="user", content="Bob private planning")
+        msg_id = db._conn.execute(
+            "SELECT id FROM messages WHERE session_id = 'bob'"
+        ).fetchone()[0]
+
+        result = json.loads(
+            session_search(
+                session_id="bob",
+                around_message_id=msg_id,
+                db=db,
+                requester_user_id="telegram:alice",
+            )
+        )
+
+        assert result["success"] is False
+        assert "requester-visible" in result["error"]
+
+    def test_existing_session_row_gets_policy_metadata_on_retry(self, db):
+        db.create_session("alice", source="telegram", user_id="telegram:alice-raw")
+        db.create_session(
+            "alice",
+            source="telegram",
+            user_id="telegram:alice-raw",
+            requester_principal="telegram:alice",
+            subject_owner_id="owner-a",
+            visibility="correspondent_private",
+        )
+
+        session = db.get_session("alice")
+
+        assert session["requester_principal"] == "telegram:alice"
+        assert session["subject_owner_id"] == "owner-a"
+        assert session["visibility"] == "correspondent_private"
+
+    def test_browse_filters_to_subject_owner_and_visibility(self, db):
+        db.create_session(
+            "alice_owner_a",
+            source="telegram",
+            user_id="telegram:alice",
+            requester_principal="telegram:alice",
+            subject_owner_id="owner-a",
+            visibility="correspondent_private",
+        )
+        db.append_message("alice_owner_a", role="user", content="Alice owner-a planning")
+        db.create_session(
+            "alice_owner_b",
+            source="telegram",
+            user_id="telegram:alice",
+            requester_principal="telegram:alice",
+            subject_owner_id="owner-b",
+            visibility="correspondent_private",
+        )
+        db.append_message("alice_owner_b", role="user", content="Alice owner-b planning")
+        db.create_session(
+            "legacy",
+            source="telegram",
+            user_id="telegram:alice",
+        )
+        db.append_message("legacy", role="user", content="Legacy unscoped planning")
+
+        result = json.loads(
+            session_search(
+                db=db,
+                requester_principal="telegram:alice",
+                subject_owner_id="owner-a",
+                visibility=["correspondent_private", "shared", "shared:telegram:alice"],
+                shared_visibility=["shared", "shared:telegram:alice"],
+            )
+        )
+
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["alice_owner_a"]
+
+    def test_discovery_filters_to_subject_owner_and_visibility(self, db):
+        db.create_session(
+            "alice_owner_a",
+            source="telegram",
+            user_id="telegram:alice",
+            requester_principal="telegram:alice",
+            subject_owner_id="owner-a",
+            visibility="correspondent_private",
+        )
+        db.append_message("alice_owner_a", role="user", content="project zephyr allowed")
+        db.create_session(
+            "alice_owner_b",
+            source="telegram",
+            user_id="telegram:alice",
+            requester_principal="telegram:alice",
+            subject_owner_id="owner-b",
+            visibility="correspondent_private",
+        )
+        db.append_message("alice_owner_b", role="user", content="project zephyr wrong owner")
+        db.create_session(
+            "owner_private",
+            source="telegram",
+            user_id="telegram:owner",
+            requester_principal="telegram:owner",
+            subject_owner_id="owner-a",
+            visibility="owner_private",
+        )
+        db.append_message("owner_private", role="user", content="project zephyr owner private")
+
+        result = json.loads(
+            session_search(
+                query="zephyr",
+                db=db,
+                requester_principal="telegram:alice",
+                subject_owner_id="owner-a",
+                visibility=["correspondent_private", "shared", "shared:telegram:alice"],
+                shared_visibility=["shared", "shared:telegram:alice"],
+            )
+        )
+
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["alice_owner_a"]
+
+    def test_discovery_allows_explicitly_shared_owner_session(self, db):
+        db.create_session(
+            "owner_private",
+            source="telegram",
+            user_id="telegram:owner",
+            requester_principal="telegram:owner",
+            subject_owner_id="owner-a",
+            visibility="owner_private",
+        )
+        db.append_message("owner_private", role="user", content="project zephyr private")
+        db.create_session(
+            "shared_with_alice",
+            source="telegram",
+            user_id="telegram:owner",
+            requester_principal="telegram:owner",
+            subject_owner_id="owner-a",
+            visibility="shared:telegram:alice",
+        )
+        db.append_message("shared_with_alice", role="user", content="project zephyr shared")
+
+        result = json.loads(
+            session_search(
+                query="zephyr",
+                db=db,
+                requester_principal="telegram:alice",
+                subject_owner_id="owner-a",
+                visibility=["correspondent_private", "shared", "shared:telegram:alice"],
+                shared_visibility=["shared", "shared:telegram:alice"],
+            )
+        )
+
+        assert result["success"] is True
+        assert [r["session_id"] for r in result["results"]] == ["shared_with_alice"]
+
+    def test_scroll_rejects_session_outside_owner_scope(self, db):
+        db.create_session(
+            "alice_owner_b",
+            source="telegram",
+            user_id="telegram:alice",
+            requester_principal="telegram:alice",
+            subject_owner_id="owner-b",
+            visibility="correspondent_private",
+        )
+        db.append_message("alice_owner_b", role="user", content="Alice private planning")
+        msg_id = db._conn.execute(
+            "SELECT id FROM messages WHERE session_id = 'alice_owner_b'"
+        ).fetchone()[0]
+
+        result = json.loads(
+            session_search(
+                session_id="alice_owner_b",
+                around_message_id=msg_id,
+                db=db,
+                requester_principal="telegram:alice",
+                subject_owner_id="owner-a",
+                visibility=["correspondent_private", "shared", "shared:telegram:alice"],
+                shared_visibility=["shared", "shared:telegram:alice"],
+            )
+        )
+
+        assert result["success"] is False
+        assert "requester-visible" in result["error"]
+
+
 class TestFormatTimestamp:
     def test_unix_timestamp(self):
         out = _format_timestamp(1700000000)

@@ -79,6 +79,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import hashlib
 import inspect
 import json
 import logging
@@ -1716,6 +1717,7 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+_server_config_signatures: Dict[str, str] = {}
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -1886,8 +1888,7 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
+        srv = _get_mcp_server_for_current_context(server_name)
         if srv is not None and hasattr(srv, "_reconnect_event"):
             loop = _mcp_loop
             if loop is not None and loop.is_running():
@@ -2021,8 +2022,7 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
-    with _lock:
-        srv = _servers.get(server_name)
+    srv = _get_mcp_server_for_current_context(server_name)
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -2105,6 +2105,106 @@ _stdio_pids: Dict[int, str] = {}  # pid -> server_name
 # Separate from _stdio_pids so cleanup sweeps never race with active
 # sessions (e.g. concurrent cron jobs or live user chats).
 _orphan_stdio_pids: set = set()
+
+
+def _mcp_config_signature(config: dict) -> str:
+    """Stable fingerprint for an effective, policy-projected MCP config."""
+    payload = json.dumps(config or {}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _mcp_cache_scope(permission_context=None) -> str | None:
+    if permission_context is None or not hasattr(permission_context, "signature"):
+        return None
+    try:
+        return str(permission_context.signature() or "").strip() or None
+    except Exception:
+        return None
+
+
+def _mcp_server_cache_key(name: str, config: dict, cache_scope: str | None = None) -> str:
+    """Return the physical cache key for a logical MCP server name."""
+
+    logical_name = str(name or "")
+    if not cache_scope:
+        return logical_name
+    return f"{logical_name}@@{cache_scope}:{_mcp_config_signature(config)}"
+
+
+def _mcp_server_logical_name(cache_key: str) -> str:
+    return str(cache_key or "").split("@@", 1)[0]
+
+
+def _current_mcp_server_cache_key(server_name: str) -> str | None:
+    """Resolve the active physical server key for this execution context.
+
+    Returns None when the current permission context does not expose the
+    logical server, which prevents a hidden server from falling back to a
+    different principal's cached client.
+    """
+
+    try:
+        from gateway.permissions import get_current_permission_context
+
+        permission_context = get_current_permission_context()
+    except Exception:
+        permission_context = None
+
+    cache_scope = _mcp_cache_scope(permission_context)
+    if cache_scope is None:
+        return server_name
+
+    servers = _load_mcp_config(permission_context=permission_context)
+    cfg = servers.get(server_name)
+    if not isinstance(cfg, dict):
+        return None
+    return _mcp_server_cache_key(server_name, cfg, cache_scope)
+
+
+def _get_mcp_server_for_current_context(server_name: str) -> Optional[MCPServerTask]:
+    cache_key = _current_mcp_server_cache_key(server_name)
+    if cache_key is None:
+        return None
+    with _lock:
+        return _servers.get(cache_key)
+
+
+def _get_any_mcp_server_for_logical_name(server_name: str) -> Optional[MCPServerTask]:
+    with _lock:
+        server = _servers.get(server_name)
+        if server is not None:
+            return server
+        for cache_key, candidate in _servers.items():
+            if _mcp_server_logical_name(cache_key) == server_name:
+                return candidate
+    return None
+
+
+def _forget_mcp_server(name: str) -> Optional[MCPServerTask]:
+    """Remove cached state for one server and return the old task if present."""
+    with _lock:
+        server = _servers.pop(name, None)
+        _server_config_signatures.pop(name, None)
+        _server_error_counts.pop(name, None)
+        _server_breaker_opened_at.pop(name, None)
+        sanitized = sanitize_mcp_name_component(name)
+        _parallel_safe_servers.discard(sanitized)
+        stale_tools = [
+            tool_name
+            for tool_name, server_name in _mcp_tool_server_names.items()
+            if server_name == name
+        ]
+        for tool_name in stale_tools:
+            _mcp_tool_server_names.pop(tool_name, None)
+    return server
+
+
+def _shutdown_cached_server(server: MCPServerTask, *, timeout: float = 10.0) -> None:
+    """Best-effort synchronous shutdown for a cached MCP server task."""
+    try:
+        _run_on_mcp_loop(server.shutdown, timeout=timeout)
+    except Exception as exc:
+        logger.debug("MCP server '%s' stale-cache shutdown failed: %s", server.name, exc)
 
 
 def _snapshot_child_pids() -> set:
@@ -2243,7 +2343,7 @@ def _interpolate_env_vars(value):
     return value
 
 
-def _load_mcp_config() -> Dict[str, dict]:
+def _load_mcp_config(permission_context=None) -> Dict[str, dict]:
     """Read ``mcp_servers`` from the Hermes config file.
 
     Returns a dict of ``{server_name: server_config}`` or empty dict.
@@ -2266,7 +2366,14 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        resolved = {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        if permission_context is not None and hasattr(permission_context, "filter_mcp_servers"):
+            try:
+                return permission_context.filter_mcp_servers(resolved)
+            except Exception as exc:
+                logger.warning("MCP policy projection failed; hiding MCP servers: %s", exc)
+                return {}
+        return resolved
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -2330,8 +2437,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 }, ensure_ascii=False)
             # Cooldown elapsed → fall through as a half-open probe.
 
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_mcp_server_for_current_context(server_name)
         if not server or not server.session:
             _bump_server_error(server_name)
             return json.dumps({
@@ -2444,8 +2550,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_mcp_server_for_current_context(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -2504,8 +2609,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_mcp_server_for_current_context(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -2562,8 +2666,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_mcp_server_for_current_context(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -2627,8 +2730,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_mcp_server_for_current_context(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -2696,8 +2798,7 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_mcp_server_for_current_context(server_name)
         return server is not None and server.session is not None
 
     return _check
@@ -3053,7 +3154,7 @@ def _existing_tool_names() -> List[str]:
         for mcp_tool in server._tools:
             schema = _convert_mcp_schema(server.name, mcp_tool)
             names.append(schema["name"])
-    return names
+    return list(dict.fromkeys(names))
 
 
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
@@ -3166,7 +3267,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     return registered_names
 
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(
+    name: str,
+    config: dict,
+    *,
+    cache_scope: str | None = None,
+) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
@@ -3176,8 +3282,10 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _connect_server(name, config),
         timeout=connect_timeout,
     )
+    cache_key = _mcp_server_cache_key(name, config, cache_scope)
     with _lock:
-        _servers[name] = server
+        _servers[cache_key] = server
+        _server_config_signatures[cache_key] = _mcp_config_signature(config)
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -3195,7 +3303,11 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(
+    servers: Dict[str, dict],
+    *,
+    cache_scope: str | None = None,
+) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -3215,13 +3327,39 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
+    stale_servers: List[MCPServerTask] = []
+    if cache_scope is None:
+        for srv_name, srv_cfg in servers.items():
+            if not _parse_boolish(srv_cfg.get("enabled", True), default=True):
+                continue
+            next_signature = _mcp_config_signature(srv_cfg)
+            with _lock:
+                current = _servers.get(srv_name)
+                current_signature = _server_config_signatures.get(srv_name)
+            if current is not None and current_signature and current_signature != next_signature:
+                stale = _forget_mcp_server(srv_name)
+                if stale is not None:
+                    stale_servers.append(stale)
+
+    if stale_servers:
+        _ensure_mcp_loop()
+        for stale in stale_servers:
+            logger.info(
+                "MCP server '%s': effective config changed; reconnecting scoped client",
+                stale.name,
+            )
+            _shutdown_cached_server(stale)
+
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if (
+                _mcp_server_cache_key(k, v, cache_scope) not in _servers
+                and _parse_boolish(v.get("enabled", True), default=True)
+            )
         }
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
@@ -3238,7 +3376,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
-        return await _discover_and_register_server(name, cfg)
+        if cache_scope is None:
+            return await _discover_and_register_server(name, cfg)
+        return await _discover_and_register_server(name, cfg, cache_scope=cache_scope)
 
     async def _discover_all():
         server_names = list(new_servers.keys())
@@ -3275,9 +3415,19 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Log a summary so ACP callers get visibility into what was registered.
     with _lock:
-        connected = [n for n in new_servers if n in _servers]
+        connected = [
+            n
+            for n, cfg in new_servers.items()
+            if _mcp_server_cache_key(n, cfg, cache_scope) in _servers
+        ]
         new_tool_count = sum(
-            len(getattr(_servers[n], "_registered_tool_names", []))
+            len(
+                getattr(
+                    _servers[_mcp_server_cache_key(n, new_servers[n], cache_scope)],
+                    "_registered_tool_names",
+                    [],
+                )
+            )
             for n in connected
         )
     failed = len(new_servers) - len(connected)
@@ -3290,7 +3440,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(permission_context=None) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -3306,26 +3456,40 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 
-    servers = _load_mcp_config()
+    servers = _load_mcp_config(permission_context=permission_context)
     if not servers:
         logger.debug("No MCP servers configured")
         return []
 
+    cache_scope = _mcp_cache_scope(permission_context)
     with _lock:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if (
+                _mcp_server_cache_key(name, cfg, cache_scope) not in _servers
+                and _parse_boolish(cfg.get("enabled", True), default=True)
+            )
         ]
 
-    tool_names = register_mcp_servers(servers)
+    tool_names = register_mcp_servers(servers, cache_scope=cache_scope)
     if not new_server_names:
         return tool_names
 
     with _lock:
-        connected_server_names = [name for name in new_server_names if name in _servers]
+        connected_server_names = [
+            name
+            for name in new_server_names
+            if _mcp_server_cache_key(name, servers[name], cache_scope) in _servers
+        ]
         new_tool_count = sum(
-            len(getattr(_servers[name], "_registered_tool_names", []))
+            len(
+                getattr(
+                    _servers[_mcp_server_cache_key(name, servers[name], cache_scope)],
+                    "_registered_tool_names",
+                    [],
+                )
+            )
             for name in connected_server_names
         )
 
@@ -3376,6 +3540,11 @@ def get_mcp_status() -> List[dict]:
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         server = active_servers.get(name)
+        if server is None:
+            for cache_key, candidate in active_servers.items():
+                if _mcp_server_logical_name(cache_key) == name:
+                    server = candidate
+                    break
         if server and server.session is not None:
             entry = {
                 "name": name,
@@ -3475,6 +3644,10 @@ def shutdown_mcp_servers():
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
+        with _lock:
+            _server_config_signatures.clear()
+            _server_error_counts.clear()
+            _server_breaker_opened_at.clear()
         _stop_mcp_loop()
         return
 
@@ -3490,6 +3663,9 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            _server_config_signatures.clear()
+            _server_error_counts.clear()
+            _server_breaker_opened_at.clear()
 
     with _lock:
         loop = _mcp_loop

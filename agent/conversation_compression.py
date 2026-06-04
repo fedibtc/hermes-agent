@@ -388,11 +388,21 @@ def compress_context(
             except Exception:
                 os.environ["HERMES_SESSION_ID"] = agent.session_id
             agent._session_db_created = False
+            policy_ctx = getattr(agent, "tool_policy_context", None)
+            requester_principal = (
+                getattr(getattr(policy_ctx, "requester", None), "key", None)
+                if policy_ctx is not None
+                else None
+            ) or getattr(agent, "_session_user_id", None)
             agent._session_db.create_session(
                 session_id=agent.session_id,
                 source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=agent.model,
                 model_config=agent._session_init_model_config,
+                user_id=getattr(agent, "_session_user_id", None),
+                requester_principal=requester_principal,
+                subject_owner_id=getattr(policy_ctx, "subject_owner_id", None),
+                visibility=getattr(policy_ctx, "session_visibility", None),
                 parent_session_id=old_session_id,
             )
             agent._session_db_created = True

@@ -806,26 +806,28 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
         self.assertIn("all imports ok", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_empty_enabled_tools_uses_all(self):
-        """When enabled_tools is [] (empty), all sandbox tools should be available."""
+    def test_empty_enabled_tools_exposes_no_sandbox_helpers(self):
+        """An explicit empty allowlist must not fall back to all helpers."""
         code = (
-            "from hermes_tools import terminal, web_search\n"
-            "print('imports ok')\n"
+            "import hermes_tools\n"
+            "print('terminal_available:', hasattr(hermes_tools, 'terminal'))\n"
+            "print('web_search_available:', hasattr(hermes_tools, 'web_search'))\n"
         )
         with patch("model_tools.handle_function_call",
                     return_value=json.dumps({"ok": True})):
             result = json.loads(execute_code(code, task_id="test-empty",
                                              enabled_tools=[]))
         self.assertEqual(result["status"], "success")
-        self.assertIn("imports ok", result["output"])
+        self.assertIn("terminal_available: False", result["output"])
+        self.assertIn("web_search_available: False", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_nonoverlapping_tools_fallback(self):
+    def test_nonoverlapping_tools_exposes_no_sandbox_helpers(self):
         """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS,
-        should fall back to all allowed tools."""
+        the sandbox helper allowlist is empty."""
         code = (
-            "from hermes_tools import terminal\n"
-            "print('fallback ok')\n"
+            "import hermes_tools\n"
+            "print('terminal_available:', hasattr(hermes_tools, 'terminal'))\n"
         )
         with patch("model_tools.handle_function_call",
                     return_value=json.dumps({"ok": True})):
@@ -834,7 +836,26 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
                 enabled_tools=["vision_analyze", "browser_snapshot"],
             ))
         self.assertEqual(result["status"], "success")
-        self.assertIn("fallback ok", result["output"])
+        self.assertIn("terminal_available: False", result["output"])
+
+    @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
+    def test_execute_code_only_allowlist_exposes_no_sandbox_helpers(self):
+        """Policy allowlists may include execute_code but no helper tools."""
+        code = (
+            "import hermes_tools\n"
+            "print('terminal_available:', hasattr(hermes_tools, 'terminal'))\n"
+            "print('read_file_available:', hasattr(hermes_tools, 'read_file'))\n"
+        )
+        with patch("model_tools.handle_function_call",
+                    return_value=json.dumps({"ok": True})):
+            result = json.loads(execute_code(
+                code,
+                task_id="test-execute-code-only",
+                enabled_tools=["execute_code"],
+            ))
+        self.assertEqual(result["status"], "success")
+        self.assertIn("terminal_available: False", result["output"])
+        self.assertIn("read_file_available: False", result["output"])
 
 
 # ---------------------------------------------------------------------------

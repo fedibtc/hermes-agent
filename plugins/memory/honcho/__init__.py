@@ -543,7 +543,13 @@ class HonchoMemoryProvider(MemoryProvider):
 
         return header
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        permission_context: Any = None,
+    ) -> str:
         """Return base context (representation + card) plus dialectic supplement.
 
         Assembles two layers:
@@ -554,6 +560,9 @@ class HonchoMemoryProvider(MemoryProvider):
         B5: Respects injection_frequency — "first-turn" returns cached/empty after turn 0.
         Port #3265: Truncates to context_tokens budget.
         """
+        if self._suppresses_pinned_owner_context(permission_context):
+            return ""
+
         if self._cron_skipped:
             return ""
 
@@ -683,6 +692,17 @@ class HonchoMemoryProvider(MemoryProvider):
         result = self._truncate_to_budget(result)
 
         return result
+
+    def _suppresses_pinned_owner_context(self, permission_context: Any) -> bool:
+        """Avoid injecting single-owner Honcho memory into correspondent turns."""
+        if permission_context is None:
+            return False
+        if bool(getattr(permission_context, "is_owner", False)):
+            return False
+        cfg = self._config
+        if cfg is None:
+            return False
+        return bool(getattr(cfg, "pin_peer_name", False))
 
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""

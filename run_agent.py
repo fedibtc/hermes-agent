@@ -414,6 +414,10 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        allowed_tool_names: List[str] | None = None,
+        tool_policy_context: Any = None,
+        session_user_id: str | None = None,
+        session_search_user_id: str | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -484,6 +488,10 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            allowed_tool_names=allowed_tool_names,
+            tool_policy_context=tool_policy_context,
+            session_user_id=session_user_id,
+            session_search_user_id=session_search_user_id,
         )
 
     def _get_session_db_for_recall(self):
@@ -509,6 +517,12 @@ class AIAgent:
         """Create session DB row on first use. Disables _session_db on failure."""
         if self._session_db_created or not self._session_db:
             return
+        policy_ctx = getattr(self, "tool_policy_context", None)
+        requester_principal = (
+            getattr(getattr(policy_ctx, "requester", None), "key", None)
+            if policy_ctx is not None
+            else None
+        ) or getattr(self, "_session_user_id", None)
         try:
             self._session_db.create_session(
                 session_id=self.session_id,
@@ -516,7 +530,10 @@ class AIAgent:
                 model=self.model,
                 model_config=self._session_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                user_id=getattr(self, "_session_user_id", None),
+                requester_principal=requester_principal,
+                subject_owner_id=getattr(policy_ctx, "subject_owner_id", None),
+                visibility=getattr(policy_ctx, "session_visibility", None),
                 parent_session_id=self._parent_session_id,
             )
             self._session_db_created = True

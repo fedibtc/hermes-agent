@@ -376,6 +376,34 @@ class TestMemoryStorePersistence:
         store.load_from_disk()
         assert len(store.memory_entries) == 2
 
+    def test_user_namespace_isolated_and_path_safe(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        store1 = MemoryStore(user_namespace="../alice")
+        store1.load_from_disk()
+        store1.add("user", "Alice prefers concise answers")
+
+        store2 = MemoryStore(user_namespace="../bob")
+        store2.load_from_disk()
+
+        assert "Alice prefers concise answers" in store1.user_entries
+        assert store2.user_entries == []
+        assert not (tmp_path / ".." / "alice" / "USER.md").exists()
+        assert len(list((tmp_path / "users").glob("*/USER.md"))) == 1
+
+    def test_owner_and_shared_memory_namespaces_are_separate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        owner_store = MemoryStore(owner_namespace="owner:tav", use_owner_memory=True)
+        owner_store.load_from_disk()
+        owner_store.add("memory", "Owner private calendar details")
+
+        shared_store = MemoryStore(owner_namespace="owner:tav", use_owner_memory=False)
+        shared_store.load_from_disk()
+
+        assert "Owner private calendar details" in owner_store.memory_entries
+        assert shared_store.memory_entries == []
+
 
 class TestMemoryStoreSnapshot:
     def test_snapshot_frozen_at_load(self, store):

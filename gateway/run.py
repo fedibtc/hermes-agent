@@ -332,6 +332,32 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
+def _create_aiagent_compat(AIAgent, **kwargs):
+    """Create an AIAgent while tolerating older constructor signatures."""
+
+    original_kwargs = dict(kwargs)
+    try:
+        params = inspect.signature(AIAgent).parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+        if not accepts_kwargs:
+            kwargs = {key: value for key, value in kwargs.items() if key in params}
+    except (TypeError, ValueError):
+        pass
+
+    agent = AIAgent(**kwargs)
+    for attr in ("tool_policy_context", "session_user_id", "session_search_user_id"):
+        value = original_kwargs.get(attr)
+        if value is not None and not hasattr(agent, attr):
+            try:
+                setattr(agent, attr, value)
+            except Exception:
+                pass
+    return agent
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -1028,6 +1054,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
+from gateway.conversation_policy import resolve_conversation_policy
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -1599,6 +1626,38 @@ def _normalize_empty_agent_response(
         )
 
     return response
+
+
+def _scrub_correspondence_blocked_assistant_turn(
+    session_db: Any,
+    session_id: str,
+    agent_messages: list,
+    safe_response: str,
+) -> None:
+    """Scrub a blocked non-owner assistant response from durable and local state."""
+
+    safe_text = str(safe_response or "")
+    if session_db is not None and session_id:
+        try:
+            scrub = getattr(session_db, "scrub_latest_assistant_message", None)
+            if callable(scrub):
+                scrub(session_id, safe_text)
+        except Exception:
+            logger.debug(
+                "Failed to scrub blocked assistant message for session %s",
+                session_id,
+                exc_info=True,
+            )
+
+    for msg in reversed(agent_messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            msg["content"] = safe_text
+            msg.pop("reasoning", None)
+            msg.pop("reasoning_content", None)
+            msg.pop("reasoning_details", None)
+            msg.pop("codex_reasoning_items", None)
+            msg.pop("codex_message_items", None)
+            break
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
@@ -7173,6 +7232,12 @@ class GatewayRunner:
             # The agent thread is blocked on a threading.Event inside
             # tools/approval.py — sending an interrupt won't unblock it.
             # Route directly to the approval handler so the event is signalled.
+            if _cmd_def_inner and _cmd_def_inner.name == "approvals":
+                return await self._handle_approvals_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "memory-migrate":
+                return await self._handle_memory_migrate_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name in {"approve", "deny"}:
                 if _cmd_def_inner.name == "approve":
                     return await self._handle_approve_command(event)
@@ -7181,6 +7246,15 @@ class GatewayRunner:
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "audit":
+                return await self._handle_audit_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "permissions":
+                return await self._handle_permissions_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "users":
+                return await self._handle_users_command(event)
 
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
@@ -7499,6 +7573,15 @@ class GatewayRunner:
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
+        if canonical == "audit":
+            return await self._handle_audit_command(event)
+
+        if canonical == "permissions":
+            return await self._handle_permissions_command(event)
+
+        if canonical == "users":
+            return await self._handle_users_command(event)
+
         if canonical == "status":
             return await self._handle_status_command(event)
 
@@ -7575,6 +7658,12 @@ class GatewayRunner:
 
         if canonical == "bundles":
             return await self._handle_bundles_command(event)
+
+        if canonical == "approvals":
+            return await self._handle_approvals_command(event)
+
+        if canonical == "memory-migrate":
+            return await self._handle_memory_migrate_command(event)
 
         if canonical == "approve":
             return await self._handle_approve_command(event)
@@ -8227,6 +8316,7 @@ class GatewayRunner:
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
+        _pcfg: Dict[str, Any] = {}
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -8234,7 +8324,62 @@ class GatewayRunner:
             pass
 
         # Build the context prompt to inject
-        context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        context_prompt = build_session_context_prompt(
+            context,
+            redact_pii=_redact_pii,
+            user_config=_pcfg,
+        )
+        permission_context = None
+        _permission_resolver = None
+        try:
+            from gateway.permissions import PermissionResolver
+
+            _permission_resolver = PermissionResolver(_pcfg)
+            permission_context = _permission_resolver.resolve(
+                source,
+                session_key=session_key,
+            )
+        except Exception as _policy_err:
+            if _permission_resolver is not None and _permission_resolver.is_configured():
+                permission_context = _permission_resolver.fail_closed_context(
+                    source,
+                    session_key=session_key,
+                )
+                logger.warning("Gateway policy resolution failed; using deny-all policy context: %s", _policy_err)
+            else:
+                logger.warning("Gateway policy resolution failed with no configured policy: %s", _policy_err)
+        if permission_context is not None:
+            _policy_prompt = permission_context.prompt_block()
+            if _policy_prompt:
+                context_prompt = f"{context_prompt}\n\n{_policy_prompt}"
+            try:
+                from gateway.owner_audit import append_audit_event_for_context
+
+                append_audit_event_for_context(
+                    permission_context,
+                    "policy_resolved",
+                    details={
+                        "relationship": getattr(permission_context, "relationship", ""),
+                        "policy_name": getattr(permission_context, "policy_name", ""),
+                        "is_owner": bool(getattr(permission_context, "is_owner", False)),
+                        "scope": getattr(permission_context, "scope", ""),
+                        "signature": (
+                            permission_context.signature()
+                            if hasattr(permission_context, "signature")
+                            else ""
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                from gateway.owner_twin_context import assemble_owner_twin_context
+
+                _twin_prompt = assemble_owner_twin_context(_pcfg, permission_context)
+                if _twin_prompt:
+                    context_prompt = f"{context_prompt}\n\n{_twin_prompt}"
+            except Exception as _twin_err:
+                logger.warning("Owner twin context assembly failed: %s", _twin_err)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -8663,7 +8808,13 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and not getattr(source, "is_bot", False)
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -8748,6 +8899,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                permission_context=permission_context,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8821,6 +8973,59 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+            try:
+                if permission_context is not None and not getattr(permission_context, "is_owner", False):
+                    from gateway.correspondence_evaluator import evaluate_correspondence
+
+                    _correspondence_eval = evaluate_correspondence(
+                        response,
+                        permission_context=permission_context,
+                        messages=agent_messages,
+                    )
+                    agent_result["correspondence_evaluation"] = _correspondence_eval.to_dict()
+                    if _correspondence_eval.decision != "allow":
+                        logger.warning(
+                            "Correspondence evaluator replaced response for session %s: decision=%s violations=%s",
+                            session_key,
+                            _correspondence_eval.decision,
+                            ",".join(_correspondence_eval.violations),
+                        )
+                        response = _correspondence_eval.safe_response
+                        agent_result["final_response"] = response
+                        _scrub_correspondence_blocked_assistant_turn(
+                            self._session_db,
+                            agent_result.get("session_id") or session_entry.session_id,
+                            agent_messages,
+                            response,
+                        )
+            except Exception as _correspondence_err:
+                logger.warning(
+                    "Correspondence evaluator failed; using safe fallback for non-owner session %s: %s",
+                    session_key,
+                    _correspondence_err,
+                )
+                if permission_context is not None and not getattr(permission_context, "is_owner", False):
+                    try:
+                        from gateway.owner_audit import append_audit_event_for_context
+
+                        append_audit_event_for_context(
+                            permission_context,
+                            "correspondence_evaluator_failed",
+                            details={"error_type": type(_correspondence_err).__name__},
+                        )
+                    except Exception:
+                        pass
+                    response = (
+                        "I can't safely complete that response without owner approval. "
+                        "I can ask the owner to review it."
+                    )
+                    agent_result["final_response"] = response
+                    _scrub_correspondence_blocked_assistant_turn(
+                        self._session_db,
+                        agent_result.get("session_id") or session_entry.session_id,
+                        agent_messages,
+                        response,
+                    )
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -9482,6 +9687,19 @@ class GatewayRunner:
 
         if not canonical_cmd:
             return None
+        try:
+            from gateway.permissions import PermissionResolver
+
+            resolver = PermissionResolver(_load_gateway_config())
+            if resolver.is_configured():
+                ctx = resolver.resolve(
+                    source,
+                    session_key=self._session_key_for_source(source),
+                )
+                if ctx is not None and getattr(ctx, "is_owner", False):
+                    return None
+        except Exception:
+            logger.debug("Owner slash access resolution failed", exc_info=True)
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
@@ -9557,6 +9775,255 @@ class GatewayRunner:
             f"User ID: `{user_id}`\n"
             f"Tier: user\n"
             f"Slash commands you can run: {runnable_str}"
+        )
+
+
+    def _owner_policy_context_for_event(
+        self,
+        event: MessageEvent,
+        *,
+        not_configured: str = "Owner policy is not configured.",
+        owner_only: str = "This command is owner-only.",
+    ):
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        try:
+            from gateway.permissions import PermissionResolver
+
+            resolver = PermissionResolver(_load_gateway_config())
+            if not resolver.is_configured():
+                return None, set(), not_configured
+            try:
+                context = resolver.resolve(source, session_key=session_key)
+            except Exception:
+                context = resolver.fail_closed_context(source, session_key=session_key)
+        except Exception as exc:
+            logger.warning("Owner policy resolution failed: %s", exc)
+            return None, set(), "Owner policy could not be resolved."
+
+        if context is None or not getattr(context, "is_owner", False):
+            return context, set(), owner_only
+
+        owner_ids = set(getattr(getattr(context, "requester", None), "owner_ids", set()) or set())
+        subject_owner_id = str(getattr(context, "subject_owner_id", "") or "").strip()
+        if subject_owner_id:
+            owner_ids.add(subject_owner_id)
+        return context, owner_ids, None
+
+    @staticmethod
+    def _source_for_principal_key(principal_key: str, base_source: SessionSource):
+        from types import SimpleNamespace
+        from gateway.principals import normalize_principal_key
+
+        key = normalize_principal_key(principal_key)
+        if not key or ":" not in key:
+            return None
+        platform, user_id = key.split(":", 1)
+        return SimpleNamespace(
+            platform=platform,
+            user_id=user_id,
+            user_id_alt=None,
+            user_name=key,
+            chat_id=getattr(base_source, "chat_id", ""),
+            chat_type=getattr(base_source, "chat_type", "dm") or "dm",
+            thread_id=getattr(base_source, "thread_id", None),
+        )
+
+    async def _handle_audit_command(self, event: MessageEvent) -> str:
+        """Handle /audit — show recent owner policy audit events."""
+
+        context, owner_ids, error = self._owner_policy_context_for_event(
+            event,
+            not_configured="Owner audit policy is not configured.",
+            owner_only="Owner audit commands are owner-only.",
+        )
+        if error:
+            return error
+
+        raw_args = event.get_command_args().strip()
+        limit = 10
+        if raw_args:
+            try:
+                limit = max(1, min(50, int(raw_args.split()[0])))
+            except ValueError:
+                return "Usage: /audit [N]"
+
+        from gateway.owner_audit import read_recent_audit_events
+
+        events: list[dict[str, Any]] = []
+        for owner_id in sorted(owner_ids):
+            events.extend(read_recent_audit_events(owner_id, limit=limit))
+        events.sort(key=lambda item: str(item.get("ts") or ""))
+        events = events[-limit:]
+        if not events:
+            return "No owner audit events recorded."
+
+        lines = [f"Recent owner audit events ({len(events)}):"]
+        for event_item in events:
+            details = event_item.get("details")
+            details = details if isinstance(details, dict) else {}
+            ts = str(event_item.get("ts") or "")
+            event_type = str(event_item.get("event_type") or "event")
+            requester = str(event_item.get("requester") or "unknown")
+            summary_parts = []
+            for key in ("tool_name", "decision", "approval_request_id", "action_type", "risk"):
+                if details.get(key):
+                    summary_parts.append(f"{key}={details[key]}")
+            suffix = " ".join(summary_parts)
+            lines.append(f"- {ts} `{event_type}` requester=`{requester}` {suffix}".rstrip())
+        return "\n".join(lines)
+
+    async def _handle_permissions_command(self, event: MessageEvent) -> str:
+        """Handle /permissions — show a principal's effective policy."""
+
+        owner_context, _owner_ids, error = self._owner_policy_context_for_event(
+            event,
+            not_configured="Owner permissions policy is not configured.",
+            owner_only="Permission inspection is owner-only.",
+        )
+        if error:
+            return error
+
+        raw_target = event.get_command_args().strip()
+        target_source = (
+            self._source_for_principal_key(raw_target, event.source)
+            if raw_target
+            else event.source
+        )
+        if target_source is None:
+            return "Usage: /permissions <platform:user-id>"
+
+        try:
+            from gateway.permissions import PermissionResolver
+
+            resolver = PermissionResolver(_load_gateway_config())
+            target_context = resolver.resolve(
+                target_source,
+                session_key=self._session_key_for_source(event.source),
+            )
+        except Exception:
+            target_context = None
+
+        if target_context is None:
+            return "No owner/correspondent policy is configured for that principal."
+
+        try:
+            from gateway.owner_audit import append_audit_event_for_context
+
+            append_audit_event_for_context(
+                owner_context,
+                "permissions_inspected",
+                details={"target_principal": getattr(target_context.requester, "key", "")},
+            )
+        except Exception:
+            pass
+
+        allow = sorted(getattr(target_context, "tool_allow_patterns", []) or [])
+        deny = sorted(getattr(target_context, "tool_deny_patterns", []) or [])
+        ask_owner = sorted(getattr(target_context, "tool_ask_owner_patterns", []) or [])
+        lines = [
+            f"Permissions for `{target_context.requester.key}`",
+            f"Subject owner: `{target_context.subject_owner_id or 'unresolved'}`",
+            f"Relationship: `{target_context.relationship}`",
+            f"Policy: `{target_context.policy_name}`",
+            f"Scope: `{target_context.scope}`",
+            f"Owner: {'yes' if target_context.is_owner else 'no'}",
+            "Allowed tools: " + (", ".join(f"`{item}`" for item in allow[:20]) if allow else "(none)"),
+        ]
+        if deny:
+            lines.append("Denied tools: " + ", ".join(f"`{item}`" for item in deny[:20]))
+        if ask_owner:
+            lines.append("Ask-owner tools: " + ", ".join(f"`{item}`" for item in ask_owner[:20]))
+        return "\n".join(lines)
+
+    async def _handle_users_command(self, event: MessageEvent) -> str:
+        """Handle /users — manage correspondent principal mappings."""
+
+        owner_context, owner_ids, error = self._owner_policy_context_for_event(
+            event,
+            not_configured="Owner user policy is not configured.",
+            owner_only="User policy management is owner-only.",
+        )
+        if error:
+            return error
+
+        try:
+            parts = shlex.split(event.get_command_args().strip())
+        except ValueError as exc:
+            return f"Could not parse /users arguments: {exc}"
+        if not parts or parts[0] in {"help", "-h", "--help"}:
+            return "Usage: /users set <platform:user-id> <relationship> [owner] [policy]"
+        if parts[0] != "set" or len(parts) < 3:
+            return "Usage: /users set <platform:user-id> <relationship> [owner] [policy]"
+
+        from gateway.principals import normalize_principal_key
+
+        principal_key = normalize_principal_key(parts[1])
+        if not principal_key or ":" not in principal_key:
+            return "Principal must look like `platform:user-id`, for example `telegram:12345`."
+
+        relationship = parts[2].strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", relationship):
+            return "Relationship must start with a letter and contain only letters, digits, `_`, or `-`."
+        if relationship == "owner":
+            return "Use the owners.<id>.principals config to add owners; /users set manages correspondents."
+
+        default_owner = sorted(owner_ids)[0] if owner_ids else getattr(owner_context, "subject_owner_id", "")
+        subject_owner_id = parts[3].strip() if len(parts) >= 4 else default_owner
+        if owner_ids and subject_owner_id not in owner_ids:
+            return f"You can only manage principals for your owner id(s): {', '.join(sorted(owner_ids))}."
+
+        policy_name = parts[4].strip() if len(parts) >= 5 else ""
+        if policy_name and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", policy_name):
+            return "Policy name must start with a letter and contain only letters, digits, `_`, or `-`."
+
+        config = _load_gateway_config()
+        if not isinstance(config, dict):
+            config = {}
+        principals = config.setdefault("principals", {})
+        if not isinstance(principals, dict):
+            principals = {}
+            config["principals"] = principals
+
+        existing = principals.get(principal_key)
+        existing = existing if isinstance(existing, dict) else {}
+        block = {
+            "relationship": relationship,
+            "subject_owner": subject_owner_id,
+        }
+        if policy_name:
+            block["policy"] = policy_name
+        if isinstance(existing.get("aliases"), list):
+            block["aliases"] = existing["aliases"]
+        principals[principal_key] = block
+
+        try:
+            from utils import atomic_yaml_write
+
+            atomic_yaml_write(_hermes_home / "config.yaml", config)
+        except Exception as exc:
+            return f"Failed to save owner user policy: {exc}"
+
+        try:
+            from gateway.owner_audit import append_audit_event_for_context
+
+            append_audit_event_for_context(
+                owner_context,
+                "principal_policy_updated",
+                details={
+                    "target_principal": principal_key,
+                    "relationship": relationship,
+                    "subject_owner": subject_owner_id,
+                    "policy": policy_name or relationship,
+                },
+            )
+        except Exception:
+            pass
+
+        policy_note = policy_name or relationship
+        return (
+            f"Updated `{principal_key}`: relationship `{relationship}`, "
+            f"subject owner `{subject_owner_id}`, policy `{policy_note}`."
         )
 
 
@@ -11722,6 +12189,25 @@ class GatewayRunner:
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            permission_context = None
+            _permission_resolver = None
+            try:
+                from gateway.permissions import PermissionResolver
+
+                _permission_resolver = PermissionResolver(user_config)
+                permission_context = _permission_resolver.resolve(
+                    source,
+                    session_key=task_id,
+                )
+            except Exception as _policy_err:
+                if _permission_resolver is not None and _permission_resolver.is_configured():
+                    permission_context = _permission_resolver.fail_closed_context(
+                        source,
+                        session_key=task_id,
+                    )
+                    logger.warning("Background task policy resolution failed; using deny-all policy context: %s", _policy_err)
+                else:
+                    logger.warning("Background task policy resolution failed with no configured policy: %s", _policy_err)
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -11748,7 +12234,8 @@ class GatewayRunner:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
-                agent = AIAgent(
+                agent = _create_aiagent_compat(
+                    AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
@@ -11776,6 +12263,17 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    tool_policy_context=permission_context,
+                    session_user_id=(
+                        getattr(permission_context, "session_user_id", None)
+                        if permission_context is not None
+                        else None
+                    ),
+                    session_search_user_id=(
+                        getattr(permission_context, "session_search_user_id", None)
+                        if permission_context is not None
+                        else None
+                    ),
                 )
                 try:
                     return agent.run_conversation(
@@ -13793,6 +14291,259 @@ class GatewayRunner:
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
+    @staticmethod
+    def _looks_like_owner_approval_id(value: str) -> bool:
+        return str(value or "").strip().startswith("apr_")
+
+    def _owner_approval_context_for_event(self, event: MessageEvent):
+        """Return (context, owner_ids, error) for owner approval commands."""
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        try:
+            from gateway.permissions import PermissionResolver
+
+            resolver = PermissionResolver(_load_gateway_config())
+            if not resolver.is_configured():
+                return None, set(), "Owner approval policy is not configured."
+            try:
+                context = resolver.resolve(source, session_key=session_key)
+            except Exception:
+                context = resolver.fail_closed_context(source, session_key=session_key)
+        except Exception as exc:
+            logger.warning("Owner approval policy resolution failed: %s", exc)
+            return None, set(), "Owner approval policy could not be resolved."
+
+        if context is None or not getattr(context, "is_owner", False):
+            return context, set(), "Owner approval commands are owner-only."
+
+        owner_ids = set(getattr(getattr(context, "requester", None), "owner_ids", set()) or set())
+        subject_owner_id = str(getattr(context, "subject_owner_id", "") or "").strip()
+        if subject_owner_id:
+            owner_ids.add(subject_owner_id)
+        return context, owner_ids, None
+
+    @staticmethod
+    def _owner_principal_platform_names(
+        request: dict[str, Any],
+        config_data: dict[str, Any] | None,
+    ) -> set[str]:
+        owner_id = str(request.get("subject_owner_id") or "").strip()
+        if not owner_id or not isinstance(config_data, dict):
+            return set()
+        owners = config_data.get("owners")
+        if not isinstance(owners, dict):
+            return set()
+        owner_block = owners.get(owner_id)
+        if not isinstance(owner_block, dict):
+            return set()
+        principals = owner_block.get("principals")
+        if isinstance(principals, str):
+            principals = [principals]
+        if not isinstance(principals, list):
+            return set()
+        platforms = set()
+        for principal in principals:
+            raw = str(principal or "").strip()
+            if ":" in raw:
+                platforms.add(raw.split(":", 1)[0].strip().lower())
+        return {platform for platform in platforms if platform}
+
+    def _owner_approval_notification_targets(
+        self,
+        request: dict[str, Any],
+        config_data: dict[str, Any] | None = None,
+    ) -> list[tuple[Platform, str, Optional[str]]]:
+        platform_names = self._owner_principal_platform_names(request, config_data)
+        targets: list[tuple[Platform, str, Optional[str]]] = []
+        seen: set[tuple[str, str, Optional[str]]] = set()
+        for platform, adapter in list(self.adapters.items()):
+            if adapter is None:
+                continue
+            platform_name = str(getattr(platform, "value", platform) or "").lower()
+            if platform_names and platform_name not in platform_names:
+                continue
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                continue
+            key = (platform_name, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((platform, str(home.chat_id), str(home.thread_id) if home.thread_id else None))
+        return targets
+
+    @staticmethod
+    def _format_owner_approval_notification(request: dict[str, Any]) -> str:
+        request_id = str(request.get("id") or "")
+        risk = str(request.get("risk") or "unknown")
+        summary = str(request.get("summary") or request.get("action_type") or "Approval request")
+        requester = str(request.get("requester") or "unknown")
+        action_type = str(request.get("action_type") or "unknown")
+        return (
+            f"Owner approval requested `{request_id}` [{risk}]\n"
+            f"{summary}\n"
+            f"From: `{requester}`\n"
+            f"Action: `{action_type}`\n"
+            f"Use `/approve {request_id}` or `/deny {request_id} [reason]`."
+        )
+
+    async def _send_owner_approval_notification(
+        self,
+        request: dict[str, Any],
+        *,
+        config_data: dict[str, Any] | None = None,
+    ) -> int:
+        message = self._format_owner_approval_notification(request)
+        delivered = 0
+        for platform, chat_id, thread_id in self._owner_approval_notification_targets(
+            request,
+            config_data=config_data,
+        ):
+            adapter = self.adapters.get(platform)
+            if not adapter:
+                continue
+            try:
+                metadata = {"thread_id": thread_id} if thread_id else None
+                result = await adapter.send(chat_id, message, metadata=metadata)
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.debug(
+                        "Owner approval notification failed for %s:%s: %s",
+                        getattr(platform, "value", platform),
+                        chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue
+                delivered += 1
+            except Exception as exc:
+                logger.debug(
+                    "Owner approval notification failed for %s:%s: %s",
+                    getattr(platform, "value", platform),
+                    chat_id,
+                    exc,
+                )
+        return delivered
+
+    async def _handle_approvals_command(self, event: MessageEvent) -> str:
+        """List pending owner approval requests for the current owner."""
+
+        context, owner_ids, error = self._owner_approval_context_for_event(event)
+        if error:
+            return error
+
+        from gateway.owner_approvals import list_pending_requests
+
+        pending = []
+        for owner_id in sorted(owner_ids):
+            pending.extend(list_pending_requests(owner_id))
+        seen: set[str] = set()
+        unique_pending = []
+        for request in pending:
+            request_id = str(request.get("id") or "")
+            if request_id and request_id not in seen:
+                seen.add(request_id)
+                unique_pending.append(request)
+
+        if not unique_pending:
+            return "No pending owner approvals."
+
+        lines = ["Pending owner approvals:"]
+        for request in unique_pending[:20]:
+            request_id = str(request.get("id") or "")
+            summary = str(request.get("summary") or request.get("action_type") or "Approval request")
+            requester = str(request.get("requester") or "unknown")
+            risk = str(request.get("risk") or "unknown")
+            action_type = str(request.get("action_type") or "unknown")
+            lines.append(
+                f"- `{request_id}` [{risk}] {summary} "
+                f"(from `{requester}`, action `{action_type}`)"
+            )
+        if len(unique_pending) > 20:
+            lines.append(f"...and {len(unique_pending) - 20} more.")
+        lines.append("")
+        lines.append("Use `/approve <id>` or `/deny <id> [reason]`.")
+        return "\n".join(lines)
+
+    async def _handle_memory_migrate_command(self, event: MessageEvent) -> str:
+        """Create an owner approval request for legacy USER.md migration."""
+
+        context, owner_ids, error = self._owner_approval_context_for_event(event)
+        if error:
+            return error
+
+        raw_args = event.get_command_args().strip().split()
+        subject_owner_id = raw_args[0] if raw_args else ""
+        if not subject_owner_id:
+            subject_owner_id = str(getattr(context, "subject_owner_id", "") or "").strip()
+        if not subject_owner_id and len(owner_ids) == 1:
+            subject_owner_id = next(iter(owner_ids))
+        if not subject_owner_id:
+            return "Usage: /memory-migrate <owner>"
+        if owner_ids and subject_owner_id not in owner_ids:
+            return f"You can only migrate memory for your owner id(s): {', '.join(sorted(owner_ids))}."
+
+        session_key = self._session_key_for_source(event.source)
+        requester = getattr(getattr(context, "requester", None), "key", "owner")
+        from gateway.owner_approvals import create_memory_migration_request
+
+        result = create_memory_migration_request(
+            subject_owner_id=subject_owner_id,
+            requester=requester,
+            requester_context={
+                "platform": str(getattr(event.source, "platform", "")),
+                "relationship": str(getattr(context, "relationship", "")),
+                "session_key": session_key,
+            },
+        )
+        if not result.get("success"):
+            return str(result.get("message") or "Could not create memory migration approval.")
+        request = result.get("request")
+        request_id = str(request.get("id") if isinstance(request, dict) else "")
+        if not request_id:
+            return str(result.get("message") or "Created memory migration approval.")
+        return (
+            f"Created owner memory migration approval `{request_id}`.\n"
+            f"Use `/approve {request_id}` to copy legacy USER.md into owner-private memory, "
+            f"or `/deny {request_id}` to leave it unchanged."
+        )
+
+    async def _handle_owner_approval_approve(self, event: MessageEvent, request_id: str) -> str:
+        context, owner_ids, error = self._owner_approval_context_for_event(event)
+        if error:
+            return error
+
+        from gateway.owner_approvals import approve_request
+
+        result = approve_request(
+            request_id,
+            owner_principal=getattr(getattr(context, "requester", None), "key", "owner"),
+            owner_ids=owner_ids,
+        )
+        if not result.get("success"):
+            return str(result.get("message") or "Could not approve owner request.")
+        execution = result.get("execution_result")
+        message = str(result.get("message") or f"Approved `{request_id}`.")
+        if isinstance(execution, dict) and execution.get("event_id"):
+            return f"Approved `{request_id}`.\n{message}\nEvent id: `{execution['event_id']}`"
+        return f"Approved `{request_id}`.\n{message}"
+
+    async def _handle_owner_approval_deny(self, event: MessageEvent, request_id: str, reason: str = "") -> str:
+        context, owner_ids, error = self._owner_approval_context_for_event(event)
+        if error:
+            return error
+
+        from gateway.owner_approvals import deny_request
+
+        result = deny_request(
+            request_id,
+            owner_principal=getattr(getattr(context, "requester", None), "key", "owner"),
+            owner_ids=owner_ids,
+            reason=reason.strip(),
+        )
+        if not result.get("success"):
+            return str(result.get("message") or "Could not deny owner request.")
+        return str(result.get("message") or f"Denied `{request_id}`.")
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -13815,6 +14566,9 @@ class GatewayRunner:
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+        first_arg = (event.get_command_args().strip().split() or [""])[0]
+        if self._looks_like_owner_approval_id(first_arg):
+            return await self._handle_owner_approval_approve(event, first_arg)
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -13861,6 +14615,14 @@ class GatewayRunner:
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+        args = event.get_command_args().strip()
+        parts = args.split(maxsplit=1)
+        if parts and self._looks_like_owner_approval_id(parts[0]):
+            return await self._handle_owner_approval_deny(
+                event,
+                parts[0],
+                parts[1] if len(parts) > 1 else "",
+            )
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -15071,6 +15833,12 @@ class GatewayRunner:
             out["tools.registry_generation"] = getattr(registry, "_generation", None)
         except Exception:
             out["tools.registry_generation"] = None
+        try:
+            from gateway.permissions import configured_policy_fingerprint
+
+            out["gateway.owner_correspondent_policy"] = configured_policy_fingerprint(cfg)
+        except Exception:
+            out["gateway.owner_correspondent_policy"] = None
 
         # Honcho identity-mapping keys live in honcho.json, not user_config.
         # HonchoSessionManager freezes the resolved peer_name / ai_peer /
@@ -15105,6 +15873,7 @@ class GatewayRunner:
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        policy_signature: str | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -15158,6 +15927,7 @@ class GatewayRunner:
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                str(policy_signature or ""),
             ],
             sort_keys=True,
             default=str,
@@ -15558,6 +16328,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        permission_context: Any = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -15633,6 +16404,31 @@ class GatewayRunner:
             "messages": api_messages,
             "stream": True,
         }
+
+        # Propagate the resolved owner/correspondent policy so the remote API
+        # server rebuilds a *restricted* agent. Without this the remote would
+        # re-expose tools and MCP servers the local policy hides, bypassing
+        # non-owner restrictions in proxy deployments. (Owner/no-policy turns
+        # serialize an unrestricted context and behave as before.)
+        if permission_context is not None and hasattr(permission_context, "to_transport_dict"):
+            try:
+                body["hermes_permission_context"] = permission_context.to_transport_dict()
+            except Exception as _pctx_err:
+                logger.warning(
+                    "Failed to serialize permission context for proxy; "
+                    "refusing to proxy a restricted turn unprotected: %s",
+                    _pctx_err,
+                )
+                if not bool(getattr(permission_context, "is_owner", False)):
+                    return {
+                        "final_response": (
+                            "I can't complete that right now — the safety policy "
+                            "for this conversation could not be applied."
+                        ),
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -15846,6 +16642,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        permission_context: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15870,6 +16667,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                permission_context=permission_context,
             )
 
         from run_agent import AIAgent
@@ -15931,12 +16729,22 @@ class GatewayRunner:
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
+        conversation_policy = resolve_conversation_policy(
+            source,
+            user_config=user_config,
+            platform_key=platform_key,
+        )
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        if conversation_policy.suppress_tool_progress:
+            # Bot-to-bot DMs need only the substantive reply. Tool-progress
+            # bubbles become loop fuel for the peer assistant.
+            tool_progress_enabled = False
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and not conversation_policy.suppress_interim_messages
             and bool(
                 resolve_display_setting(
                     user_config,
@@ -16493,6 +17301,18 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            if (
+                source.platform == Platform.SLACK
+                and source.chat_type == "dm"
+                and getattr(source, "is_bot", False)
+            ):
+                logger.debug(
+                    "status_callback suppressed for bot-authored Slack DM %s/%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    event_type,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
+                return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
                 event_type,
@@ -16701,6 +17521,11 @@ class GatewayRunner:
                 cache_keys=self._extract_cache_busting_config(user_config),
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                policy_signature=(
+                    permission_context.signature()
+                    if permission_context is not None and hasattr(permission_context, "signature")
+                    else None
+                ),
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -16722,7 +17547,8 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
-                agent = AIAgent(
+                agent = _create_aiagent_compat(
+                    AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
@@ -16753,6 +17579,17 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    tool_policy_context=permission_context,
+                    session_user_id=(
+                        getattr(permission_context, "session_user_id", None)
+                        if permission_context is not None
+                        else None
+                    ),
+                    session_search_user_id=(
+                        getattr(permission_context, "session_search_user_id", None)
+                        if permission_context is not None
+                        else None
+                    ),
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -17029,6 +17866,19 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
+            def _owner_approval_notify_sync(request: dict) -> None:
+                if not isinstance(request, dict):
+                    request = dict(request)
+                safe_schedule_threadsafe(
+                    self._send_owner_approval_notification(
+                        request,
+                        config_data=user_config,
+                    ),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="owner approval notification scheduling error",
+                )
+
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
@@ -17121,6 +17971,14 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            from gateway.owner_approvals import (
+                reset_current_approval_notifier,
+                set_current_approval_notifier,
+            )
+
+            _owner_approval_notification_token = set_current_approval_notifier(
+                _owner_approval_notify_sync
+            )
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -17166,6 +18024,7 @@ class GatewayRunner:
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
+                reset_current_approval_notifier(_owner_approval_notification_token)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.

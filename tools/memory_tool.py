@@ -24,6 +24,7 @@ Design:
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -58,6 +59,14 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+def _safe_namespace_id(value: str) -> str:
+    """Return a filesystem-safe deterministic id for a principal/owner key."""
+
+    raw = str(value or "").strip()
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return digest or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +131,24 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        *,
+        user_namespace: str | None = None,
+        owner_namespace: str | None = None,
+        shared_namespace: str | None = None,
+        use_owner_memory: bool = True,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.user_namespace = user_namespace
+        self.owner_namespace = owner_namespace
+        self.shared_namespace = shared_namespace
+        self.use_owner_memory = use_owner_memory
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
@@ -151,8 +173,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.memory_entries = self._read_file(self._path_for("memory"))
+        self.user_entries = self._read_file(self._path_for("user"))
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -243,11 +265,17 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(self, target: str) -> Path:
         mem_dir = get_memory_dir()
         if target == "user":
+            if self.user_namespace:
+                return mem_dir / "users" / _safe_namespace_id(self.user_namespace) / "USER.md"
             return mem_dir / "USER.md"
+        if self.owner_namespace:
+            if self.use_owner_memory:
+                return mem_dir / "owners" / _safe_namespace_id(self.owner_namespace) / "MEMORY.md"
+            shared = self.shared_namespace or self.owner_namespace
+            return mem_dir / "shared" / _safe_namespace_id(shared) / "MEMORY.md"
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str) -> Optional[str]:
@@ -270,8 +298,9 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_file(path, self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -718,7 +747,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

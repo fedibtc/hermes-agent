@@ -67,6 +67,20 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "terminal",
 ])
 
+
+def _sandbox_tools_for_enabled(enabled_tools: Optional[List[str]]) -> frozenset[str]:
+    """Resolve execute_code's RPC tool allowlist.
+
+    ``None`` means the caller did not provide a policy allowlist, so the
+    legacy/default sandbox exposes every sandbox-capable tool.  Any explicit
+    list is authoritative, including an empty list or a list with no sandbox
+    tools.
+    """
+
+    if enabled_tools is None:
+        return SANDBOX_ALLOWED_TOOLS
+    return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
@@ -838,10 +852,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _sandbox_tools_for_enabled(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1064,11 +1075,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _sandbox_tools_for_enabled(enabled_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1106,8 +1113,8 @@ def execute_code(
         # those bytes; the child then fails to import with a SyntaxError
         # ("'utf-8' codec can't decode byte 0x97 in position ...") because
         # Python source files are decoded as UTF-8 by default (PEP 3120).
-        # sandbox_tools is already the correct set (intersection with session
-        # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
+        # sandbox_tools is already the correct set: default tools when no
+        # allowlist was supplied, otherwise the explicit policy intersection.
         tools_src = generate_hermes_tools_module(list(sandbox_tools))
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)

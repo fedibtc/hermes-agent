@@ -153,6 +153,32 @@ class TestMessageStorage:
         assert messages[0]["content"] == "Hello"
         assert messages[1]["role"] == "assistant"
 
+    def test_scrub_latest_assistant_message_updates_content_and_search(self, db):
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message("s1", role="user", content="Hello")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="unsafe owner private answer",
+            reasoning="private reasoning",
+            reasoning_content="private reasoning content",
+            reasoning_details=[{"private": True}],
+            codex_reasoning_items=[{"private": True}],
+            codex_message_items=[{"private": True}],
+        )
+
+        assert db.scrub_latest_assistant_message("s1", "safe fallback") is True
+
+        messages = db.get_messages("s1")
+        assert messages[-1]["content"] == "safe fallback"
+        assert messages[-1]["reasoning"] is None
+        assert messages[-1]["reasoning_content"] is None
+        assert messages[-1]["reasoning_details"] is None
+        assert messages[-1]["codex_reasoning_items"] is None
+        assert messages[-1]["codex_message_items"] is None
+        assert db.search_messages("unsafe") == []
+        assert [row["session_id"] for row in db.search_messages("safe")] == ["s1"]
+
     def test_message_increments_session_count(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")
@@ -1064,6 +1090,50 @@ class TestCJKSearchFallback:
         results = db.search_messages("广西 OR 旅游", source_filter=["telegram"])
         assert len(results) == 1
         assert results[0]["source"] == "telegram"
+
+    def test_cjk_trigram_preserves_owner_legacy_scope(self, db):
+        db.create_session(
+            session_id="legacy-owner",
+            source="telegram",
+            user_id="telegram:owner-legacy",
+        )
+        db.create_session(
+            session_id="other-legacy",
+            source="telegram",
+            user_id="telegram:other",
+        )
+        db.append_message("legacy-owner", role="user", content="记忆系统计划")
+        db.append_message("other-legacy", role="user", content="记忆系统计划")
+
+        results = db.search_messages(
+            "记忆系统",
+            subject_owner_id_filter="owner-a",
+            owner_legacy_user_id_filter="telegram:owner-legacy",
+        )
+
+        assert {row["session_id"] for row in results} == {"legacy-owner"}
+
+    def test_cjk_like_preserves_owner_legacy_scope(self, db):
+        db.create_session(
+            session_id="legacy-owner",
+            source="telegram",
+            user_id="telegram:owner-legacy",
+        )
+        db.create_session(
+            session_id="other-legacy",
+            source="telegram",
+            user_id="telegram:other",
+        )
+        db.append_message("legacy-owner", role="user", content="记忆系统计划")
+        db.append_message("other-legacy", role="user", content="记忆系统计划")
+
+        results = db.search_messages(
+            "记忆",
+            subject_owner_id_filter="owner-a",
+            owner_legacy_user_id_filter="telegram:owner-legacy",
+        )
+
+        assert {row["session_id"] for row in results} == {"legacy-owner"}
 
 
 # =========================================================================
@@ -3020,4 +3090,3 @@ class TestFTS5ToolCallMigration:
             assert version == SCHEMA_VERSION
         finally:
             session_db.close()
-

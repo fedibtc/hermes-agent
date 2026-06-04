@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -191,6 +191,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     user_id TEXT,
+    requester_principal TEXT,
+    subject_owner_id TEXT,
+    visibility TEXT,
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
@@ -704,23 +707,58 @@ class SessionDB:
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
+        requester_principal: str = None,
+        subject_owner_id: str = None,
+        visibility: str = None,
         parent_session_id: str = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
             conn.execute(
-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR IGNORE INTO sessions (
+                   id, source, user_id, requester_principal, subject_owner_id,
+                   visibility, model, model_config, system_prompt,
+                   parent_session_id, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
                     user_id,
+                    requester_principal,
+                    subject_owner_id,
+                    visibility,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                ),
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET requester_principal = CASE
+                           WHEN ? IS NOT NULL
+                                AND (
+                                    COALESCE(requester_principal, '') = ''
+                                    OR requester_principal = COALESCE(user_id, '')
+                                )
+                           THEN ? ELSE requester_principal END,
+                       subject_owner_id = CASE
+                           WHEN ? IS NOT NULL AND COALESCE(subject_owner_id, '') = ''
+                           THEN ? ELSE subject_owner_id END,
+                       visibility = CASE
+                           WHEN ? IS NOT NULL AND COALESCE(visibility, '') = ''
+                           THEN ? ELSE visibility END
+                   WHERE id = ?""",
+                (
+                    requester_principal,
+                    requester_principal,
+                    subject_owner_id,
+                    subject_owner_id,
+                    visibility,
+                    visibility,
+                    session_id,
                 ),
             )
         self._execute_write(_do)
@@ -1178,6 +1216,12 @@ class SessionDB:
         self,
         source: str = None,
         exclude_sources: List[str] = None,
+        user_id: str = None,
+        requester_principal: str = None,
+        subject_owner_id: str = None,
+        visibility_filter: str | List[str] = None,
+        shared_visibility_filter: str | List[str] = None,
+        owner_legacy_user_id: str = None,
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
@@ -1235,6 +1279,18 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(str(user_id))
+        self._append_session_scope_filters(
+            where_clauses,
+            params,
+            requester_principal=requester_principal,
+            subject_owner_id=subject_owner_id,
+            visibility_filter=visibility_filter,
+            shared_visibility_filter=shared_visibility_filter,
+            owner_legacy_user_id=owner_legacy_user_id,
+        )
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         if order_by_last_active:
@@ -1541,6 +1597,45 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    def scrub_latest_assistant_message(
+        self,
+        session_id: str,
+        safe_content: str,
+    ) -> bool:
+        """Replace the latest assistant row with policy-safe content.
+
+        Used when a gateway policy evaluator blocks an already-flushed
+        assistant turn.  The FTS tables are kept in sync by the existing
+        ``messages`` UPDATE triggers.
+        """
+
+        stored_content = self._encode_content(safe_content)
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND role = 'assistant'
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """UPDATE messages
+                   SET content = ?,
+                       reasoning = NULL,
+                       reasoning_content = NULL,
+                       reasoning_details = NULL,
+                       codex_reasoning_items = NULL,
+                       codex_message_items = NULL
+                   WHERE id = ?""",
+                (stored_content, row["id"]),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
 
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.
@@ -2116,11 +2211,89 @@ class SessionDB:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
+    @staticmethod
+    def _normalize_string_filter(value: str | List[str] | Tuple[str, ...] | None) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        values = []
+        for item in value:
+            stripped = str(item).strip()
+            if stripped:
+                values.append(stripped)
+        return values
+
+    @classmethod
+    def _append_session_scope_filters(
+        cls,
+        where_clauses: List[str],
+        params: List[Any],
+        *,
+        requester_principal: str = None,
+        subject_owner_id: str = None,
+        visibility_filter: str | List[str] = None,
+        shared_visibility_filter: str | List[str] = None,
+        owner_legacy_user_id: str = None,
+        table_alias: str = "s",
+    ) -> None:
+        """Append principal/owner/visibility predicates for multi-user recall."""
+        alias = table_alias
+        requester = str(requester_principal).strip() if requester_principal is not None else ""
+        shared_values = cls._normalize_string_filter(shared_visibility_filter)
+        if requester and shared_values:
+            placeholders = ",".join("?" for _ in shared_values)
+            where_clauses.append(
+                f"({alias}.requester_principal = ? OR {alias}.visibility IN ({placeholders}))"
+            )
+            params.append(requester)
+            params.extend(shared_values)
+        elif requester:
+            where_clauses.append(f"{alias}.requester_principal = ?")
+            params.append(requester)
+        elif shared_values:
+            placeholders = ",".join("?" for _ in shared_values)
+            where_clauses.append(f"{alias}.visibility IN ({placeholders})")
+            params.extend(shared_values)
+
+        if subject_owner_id is not None:
+            owner = str(subject_owner_id).strip()
+            if owner:
+                # Owner legacy fallback: sessions created before the
+                # subject_owner_id column existed have it unset. Match those
+                # by the owner's prior user_id so historical transcripts stay
+                # visible until they are backfilled on reopen, without
+                # exposing other owners' migrated rows.
+                legacy = str(owner_legacy_user_id).strip() if owner_legacy_user_id is not None else ""
+                if legacy:
+                    where_clauses.append(
+                        f"({alias}.subject_owner_id = ?"
+                        f" OR (COALESCE({alias}.subject_owner_id, '') = '' AND {alias}.user_id = ?))"
+                    )
+                    params.append(owner)
+                    params.append(legacy)
+                else:
+                    where_clauses.append(f"{alias}.subject_owner_id = ?")
+                    params.append(owner)
+
+        visibility_values = cls._normalize_string_filter(visibility_filter)
+        if visibility_values:
+            placeholders = ",".join("?" for _ in visibility_values)
+            where_clauses.append(f"{alias}.visibility IN ({placeholders})")
+            params.extend(visibility_values)
+
     def search_messages(
         self,
         query: str,
         source_filter: List[str] = None,
         exclude_sources: List[str] = None,
+        user_id_filter: str | List[str] = None,
+        requester_principal_filter: str = None,
+        subject_owner_id_filter: str = None,
+        visibility_filter: str | List[str] = None,
+        shared_visibility_filter: str | List[str] = None,
+        owner_legacy_user_id_filter: str = None,
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
@@ -2186,6 +2359,23 @@ class SessionDB:
             exclude_placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
             params.extend(exclude_sources)
+
+        if user_id_filter is not None:
+            user_ids = [user_id_filter] if isinstance(user_id_filter, str) else list(user_id_filter)
+            user_ids = [str(u) for u in user_ids if str(u)]
+            if user_ids:
+                user_placeholders = ",".join("?" for _ in user_ids)
+                where_clauses.append(f"s.user_id IN ({user_placeholders})")
+                params.extend(user_ids)
+        self._append_session_scope_filters(
+            where_clauses,
+            params,
+            requester_principal=requester_principal_filter,
+            subject_owner_id=subject_owner_id_filter,
+            visibility_filter=visibility_filter,
+            shared_visibility_filter=shared_visibility_filter,
+            owner_legacy_user_id=owner_legacy_user_id_filter,
+        )
 
         if role_filter:
             role_placeholders = ",".join("?" for _ in role_filter)
@@ -2261,6 +2451,21 @@ class SessionDB:
                 if exclude_sources is not None:
                     tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     tri_params.extend(exclude_sources)
+                if user_id_filter is not None:
+                    user_ids = [user_id_filter] if isinstance(user_id_filter, str) else list(user_id_filter)
+                    user_ids = [str(u) for u in user_ids if str(u)]
+                    if user_ids:
+                        tri_where.append(f"s.user_id IN ({','.join('?' for _ in user_ids)})")
+                        tri_params.extend(user_ids)
+                self._append_session_scope_filters(
+                    tri_where,
+                    tri_params,
+                    requester_principal=requester_principal_filter,
+                    subject_owner_id=subject_owner_id_filter,
+                    visibility_filter=visibility_filter,
+                    shared_visibility_filter=shared_visibility_filter,
+                    owner_legacy_user_id=owner_legacy_user_id_filter,
+                )
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
@@ -2316,6 +2521,21 @@ class SessionDB:
                 if exclude_sources is not None:
                     like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     like_params.extend(exclude_sources)
+                if user_id_filter is not None:
+                    user_ids = [user_id_filter] if isinstance(user_id_filter, str) else list(user_id_filter)
+                    user_ids = [str(u) for u in user_ids if str(u)]
+                    if user_ids:
+                        like_where.append(f"s.user_id IN ({','.join('?' for _ in user_ids)})")
+                        like_params.extend(user_ids)
+                self._append_session_scope_filters(
+                    like_where,
+                    like_params,
+                    requester_principal=requester_principal_filter,
+                    subject_owner_id=subject_owner_id_filter,
+                    visibility_filter=visibility_filter,
+                    shared_visibility_filter=shared_visibility_filter,
+                    owner_legacy_user_id=owner_legacy_user_id_filter,
+                )
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
@@ -3276,4 +3496,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

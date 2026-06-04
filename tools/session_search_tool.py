@@ -31,12 +31,141 @@ support.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool
 # so they don't clutter the user's session history.
 _HIDDEN_SESSION_SOURCES = ("tool",)
+
+
+def _normalize_visibility_filter(value: Union[str, Sequence[str], None]) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    values = []
+    for item in value:
+        stripped = str(item).strip()
+        if stripped:
+            values.append(stripped)
+    return values
+
+
+def _shared_visibility_values(requester_principal: str | None) -> List[str]:
+    values = ["shared"]
+    requester = str(requester_principal or "").strip()
+    if requester:
+        values.append(f"shared:{requester}")
+    return values
+
+
+def _session_filters_from_permission_context(permission_context: Any) -> Dict[str, Any]:
+    if permission_context is None:
+        return {}
+
+    owner_id = str(getattr(permission_context, "subject_owner_id", "") or "").strip() or None
+    requester = getattr(getattr(permission_context, "requester", None), "key", None)
+    requester = str(requester or "").strip() or None
+
+    try:
+        is_owner = bool(getattr(permission_context, "is_owner"))
+    except Exception:
+        is_owner = False
+
+    filters: Dict[str, Any] = {"subject_owner_id": owner_id}
+    if is_owner:
+        # Pre-migration owner sessions have no subject_owner_id. Fall back to
+        # the owner's prior requester/user id so historical transcripts remain
+        # browsable and searchable until each one is backfilled on reopen.
+        if requester:
+            filters["owner_legacy_user_id"] = requester
+        return filters
+
+    filters["requester_principal"] = requester
+    filters["visibility"] = ["correspondent_private", *_shared_visibility_values(requester)]
+    filters["shared_visibility"] = _shared_visibility_values(requester)
+    return filters
+
+
+def _resolve_scope_filters(
+    *,
+    requester_user_id: str | None = None,
+    requester_principal: str | None = None,
+    subject_owner_id: str | None = None,
+    visibility: Union[str, Sequence[str], None] = None,
+    shared_visibility: Union[str, Sequence[str], None] = None,
+    permission_context: Any = None,
+) -> Dict[str, Any]:
+    ctx_filters = _session_filters_from_permission_context(permission_context)
+    requester_principal = (
+        requester_principal
+        if requester_principal is not None
+        else ctx_filters.get("requester_principal")
+    )
+    subject_owner_id = (
+        subject_owner_id
+        if subject_owner_id is not None
+        else ctx_filters.get("subject_owner_id")
+    )
+    visibility = visibility if visibility is not None else ctx_filters.get("visibility")
+    shared_visibility = (
+        shared_visibility
+        if shared_visibility is not None
+        else ctx_filters.get("shared_visibility")
+    )
+
+    visibility_values = _normalize_visibility_filter(visibility)
+    shared_visibility_values = _normalize_visibility_filter(shared_visibility)
+    owner_legacy_user_id = ctx_filters.get("owner_legacy_user_id")
+
+    # Legacy call sites pass requester_user_id only. Keep that mapped to the
+    # historical sessions.user_id column unless an owner/visibility policy
+    # scope is active, in which case requester_principal is the canonical key.
+    legacy_user_id = None
+    if requester_principal is None and subject_owner_id is None and not visibility_values:
+        legacy_user_id = requester_user_id
+
+    return {
+        "legacy_user_id": legacy_user_id,
+        "requester_principal": requester_principal,
+        "subject_owner_id": subject_owner_id,
+        "visibility": visibility_values,
+        "shared_visibility": shared_visibility_values,
+        "owner_legacy_user_id": owner_legacy_user_id,
+    }
+
+
+def _session_meta_visible(session_meta: Dict[str, Any], scope: Dict[str, Any]) -> bool:
+    legacy_user_id = scope.get("legacy_user_id")
+    requester = scope.get("requester_principal")
+    owner = scope.get("subject_owner_id")
+    owner_legacy_user_id = scope.get("owner_legacy_user_id")
+    visibility_values = set(scope.get("visibility") or [])
+    shared_visibility = set(scope.get("shared_visibility") or [])
+    visibility = str(session_meta.get("visibility") or "")
+
+    if legacy_user_id is not None and str(session_meta.get("user_id") or "") != str(legacy_user_id):
+        return False
+    if requester is not None:
+        if str(session_meta.get("requester_principal") or "") != str(requester) and visibility not in shared_visibility:
+            return False
+    if owner is not None:
+        sess_owner = str(session_meta.get("subject_owner_id") or "")
+        if sess_owner != str(owner):
+            # Owner legacy fallback: pre-migration rows have no
+            # subject_owner_id; admit them when the owner's prior user_id
+            # matches. Migrated rows owned by someone else are still excluded.
+            if not (
+                owner_legacy_user_id
+                and not sess_owner
+                and str(session_meta.get("user_id") or "") == str(owner_legacy_user_id)
+            ):
+                return False
+    if visibility_values and visibility not in visibility_values:
+        return False
+    return True
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -107,12 +236,24 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    scope_filters: Dict[str, Any] | None = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
+        scope_filters = scope_filters or {}
         sessions = db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            user_id=scope_filters.get("legacy_user_id"),
+            requester_principal=scope_filters.get("requester_principal"),
+            subject_owner_id=scope_filters.get("subject_owner_id"),
+            visibility_filter=scope_filters.get("visibility"),
+            shared_visibility_filter=scope_filters.get("shared_visibility"),
+            owner_legacy_user_id=scope_filters.get("owner_legacy_user_id"),
             order_by_last_active=True,
         )  # fetch extra so we can skip current
 
@@ -156,6 +297,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    scope_filters: Dict[str, Any] | None = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -180,6 +322,8 @@ def _scroll(
             window = 5
     window = max(1, min(window, 20))
 
+    scope_filters = scope_filters or {}
+
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
     if current_session_id:
@@ -199,6 +343,8 @@ def _scroll(
         session_meta = {}
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
+    if not _session_meta_visible(session_meta, scope_filters):
+        return tool_error("session_id is outside the requester-visible session scope", success=False)
 
     # Fetch the window
     try:
@@ -252,6 +398,8 @@ def _scroll(
             f"around_message_id {around_message_id} not in session_id {session_id}",
             success=False,
         )
+    if not _session_meta_visible(session_meta, scope_filters):
+        return tool_error("session_id is outside the requester-visible session scope", success=False)
 
     response = {
         "success": True,
@@ -281,15 +429,23 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    scope_filters: Dict[str, Any] | None = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
 
+    scope_filters = scope_filters or {}
     try:
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            user_id_filter=scope_filters.get("legacy_user_id"),
+            requester_principal_filter=scope_filters.get("requester_principal"),
+            subject_owner_id_filter=scope_filters.get("subject_owner_id"),
+            visibility_filter=scope_filters.get("visibility"),
+            shared_visibility_filter=scope_filters.get("shared_visibility"),
+            owner_legacy_user_id_filter=scope_filters.get("owner_legacy_user_id"),
             limit=50,  # widen so dedup-by-lineage can find distinct sessions
             offset=0,
             sort=sort,
@@ -387,6 +543,12 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    requester_user_id: str = None,
+    requester_principal: str = None,
+    subject_owner_id: str = None,
+    visibility: Union[str, Sequence[str], None] = None,
+    shared_visibility: Union[str, Sequence[str], None] = None,
+    permission_context: Any = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -406,6 +568,15 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
+    scope_filters = _resolve_scope_filters(
+        requester_user_id=requester_user_id,
+        requester_principal=requester_principal,
+        subject_owner_id=subject_owner_id,
+        visibility=visibility,
+        shared_visibility=shared_visibility,
+        permission_context=permission_context,
+    )
+
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
         return _scroll(
@@ -414,6 +585,7 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            scope_filters=scope_filters,
         )
 
     # Limit clamp [1, 10]
@@ -426,7 +598,12 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            scope_filters=scope_filters,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -447,6 +624,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        scope_filters=scope_filters,
     )
 
 
@@ -582,6 +760,19 @@ SESSION_SEARCH_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
+
+def _current_permission_context_from_kwargs(kwargs: Dict[str, Any]) -> Any:
+    if kwargs.get("permission_context") is not None:
+        return kwargs.get("permission_context")
+    if kwargs.get("tool_policy_context") is not None:
+        return kwargs.get("tool_policy_context")
+    try:
+        from gateway.permissions import get_current_permission_context
+
+        return get_current_permission_context()
+    except Exception:
+        return None
+
 registry.register(
     name="session_search",
     toolset="session_search",
@@ -596,6 +787,7 @@ registry.register(
         sort=args.get("sort"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
+        permission_context=_current_permission_context_from_kwargs(kw),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",

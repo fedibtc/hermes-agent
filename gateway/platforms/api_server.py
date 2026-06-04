@@ -961,6 +961,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        permission_context: Any = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1012,8 +1013,47 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            tool_policy_context=permission_context,
+            session_user_id=(
+                getattr(permission_context, "session_user_id", None)
+                if permission_context is not None
+                else None
+            ),
+            session_search_user_id=(
+                getattr(permission_context, "session_search_user_id", None)
+                if permission_context is not None
+                else None
+            ),
         )
         return agent
+
+    @staticmethod
+    def _deny_all_permission_context() -> Any:
+        """Build a deny-all policy context for fail-closed proxy paths.
+
+        Used when a forwarded ``hermes_permission_context`` cannot be parsed:
+        we must never fall back to an unrestricted agent, so deny every tool.
+        """
+        from gateway.permissions import PermissionContext
+        from gateway.principals import Principal
+
+        return PermissionContext(
+            requester=Principal(key="unknown", display_name="unknown"),
+            subject_owner_id="unresolved",
+            platform="api_server",
+            scope="dm",
+            session_key="",
+            relationship="blocked",
+            policy_name="proxy_policy_error",
+            tool_allow_patterns=frozenset(),
+            tool_deny_patterns=frozenset({"*"}),
+            tool_ask_owner_patterns=frozenset(),
+            resource_rules={},
+            mcp_policy={},
+            mcp_visibility_active=False,
+            mcp_projection_signature="fail_closed",
+            policy_active=True,
+        )
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -1686,6 +1726,24 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # Owner/correspondent policy forwarded by a proxying gateway. When
+        # present we rebuild the resolved context and run a *restricted* agent;
+        # malformed policy fails closed (deny-all) rather than silently running
+        # unrestricted, so a proxy bug can never widen access.
+        permission_context = None
+        _pctx_raw = body.get("hermes_permission_context")
+        if _pctx_raw is not None:
+            try:
+                from gateway.permissions import PermissionContext
+
+                permission_context = PermissionContext.from_transport_dict(_pctx_raw)
+            except Exception:
+                logger.warning(
+                    "Invalid hermes_permission_context in request; failing closed.",
+                    exc_info=True,
+                )
+                permission_context = self._deny_all_permission_context()
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -1865,6 +1923,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                permission_context=permission_context,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1884,6 +1943,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                permission_context=permission_context,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3394,6 +3454,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        permission_context: Any = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3417,6 +3478,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                permission_context=permission_context,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent

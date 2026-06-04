@@ -585,6 +585,30 @@ class CommentaryAgent:
         }
 
 
+class BotDmNoiseAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.tool_progress_callback:
+            self.tool_progress_callback(
+                "tool.started",
+                "skill_view",
+                "gateway-loop-safety",
+                {"name": "gateway-loop-safety"},
+            )
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("I'll inspect the bot protocol.", already_streamed=False)
+        time.sleep(0.1)
+        return {
+            "final_response": "FINAL: bot-to-bot mode recognized.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -686,6 +710,7 @@ async def _run_with_agent(
     chat_id="-1001",
     chat_type="group",
     thread_id="17585",
+    is_bot=False,
     adapter_cls=ProgressCaptureAdapter,
 ):
     if config_data:
@@ -713,6 +738,7 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        is_bot=is_bot,
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
@@ -807,6 +833,31 @@ async def test_run_agent_suppresses_interim_commentary_when_disabled(monkeypatch
 
     assert result.get("already_sent") is not True
     assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_suppresses_progress_and_interim_for_bot_slack_dm(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BotDmNoiseAgent,
+        session_id="sess-bot-slack-dm-noise",
+        config_data={
+            "display": {
+                "platforms": {"slack": {"tool_progress": "all"}},
+                "interim_assistant_messages": True,
+            }
+        },
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+        thread_id=None,
+        is_bot=True,
+    )
+
+    assert result["final_response"] == "FINAL: bot-to-bot mode recognized."
+    assert adapter.sent == []
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio

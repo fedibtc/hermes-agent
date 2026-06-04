@@ -25,9 +25,9 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
-import inspect
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -336,7 +336,13 @@ class MemoryManager:
 
     # -- Prefetch / recall ---------------------------------------------------
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        permission_context: Any = None,
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -345,7 +351,15 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(query, session_id=session_id)
+                kwargs: dict[str, Any] = {"session_id": session_id}
+                if permission_context is not None:
+                    try:
+                        parameters = inspect.signature(provider.prefetch).parameters
+                    except (TypeError, ValueError):
+                        parameters = {}
+                    if "permission_context" in parameters:
+                        kwargs["permission_context"] = permission_context
+                result = provider.prefetch(query, **kwargs)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:

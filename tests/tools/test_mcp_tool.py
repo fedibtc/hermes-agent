@@ -82,6 +82,50 @@ class TestLoadMCPConfig:
             result = _load_mcp_config()
             assert result == {}
 
+    def test_load_mcp_config_applies_permission_context_projection(self):
+        """Policy-aware callers get only visible MCP servers."""
+        from gateway.permissions import PermissionResolver
+
+        config = {
+            "owners": {
+                "owner": {
+                    "principals": ["telegram:owner"],
+                    "default_correspondent_policy": "coworker",
+                }
+            },
+            "principals": {
+                "telegram:employee": {
+                    "relationship": "coworker",
+                    "subject_owner": "owner",
+                },
+            },
+            "policies": {"coworker": {"tools": {"allow": ["mcp_*"]}}},
+            "mcp_policy": {
+                "owner_private": {"visible_to": ["owner"]},
+                "shared_readonly": {"visible_to": ["owner", "coworker"]},
+            },
+            "mcp_servers": {
+                "private": {"policy": "owner_private", "command": "private-mcp"},
+                "shared": {"policy": "shared_readonly", "command": "shared-mcp"},
+            },
+        }
+        source = SimpleNamespace(
+            platform="telegram",
+            user_id="employee",
+            user_id_alt=None,
+            user_name="Employee",
+            chat_type="dm",
+        )
+        context = PermissionResolver(config).resolve(source, session_key="s")
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            from tools.mcp_tool import _load_mcp_config
+
+            result = _load_mcp_config(permission_context=context)
+
+        assert set(result) == {"shared"}
+        assert "policy" not in result["shared"]
+
 
 # ---------------------------------------------------------------------------
 # Schema conversion
@@ -3726,6 +3770,167 @@ class TestRegisterMcpServers:
             assert result == ["mcp_existing_tool"]
         finally:
             _servers.pop("existing", None)
+
+    def test_reconnects_existing_server_when_effective_config_changes(self):
+        from tools.mcp_tool import (
+            _mcp_config_signature,
+            _server_config_signatures,
+            _servers,
+            register_mcp_servers,
+        )
+
+        old_config = {"command": "old", "env": {"API_TOKEN": "owner-token"}}
+        new_config = {"command": "old", "env": {"API_TOKEN": "requester-token"}}
+        old_server = _make_mock_server("shared")
+        _servers["shared"] = old_server
+        _server_config_signatures["shared"] = _mcp_config_signature(old_config)
+
+        async def fake_register(name, cfg):
+            server = _make_mock_server(name)
+            server._registered_tool_names = ["mcp_shared_lookup"]
+            _servers[name] = server
+            return ["mcp_shared_lookup"]
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._shutdown_cached_server") as mock_shutdown, \
+                 patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=["mcp_shared_lookup"]):
+                result = register_mcp_servers({"shared": new_config})
+
+            assert result == ["mcp_shared_lookup"]
+            mock_shutdown.assert_called_once_with(old_server)
+        finally:
+            _servers.pop("shared", None)
+            _server_config_signatures.pop("shared", None)
+
+    def test_scoped_register_keeps_concurrent_principal_clients(self):
+        from tools.mcp_tool import (
+            _mcp_server_cache_key,
+            _servers,
+            register_mcp_servers,
+        )
+
+        owner_config = {"command": "test", "env": {"API_TOKEN": "owner-token"}}
+        requester_config = {"command": "test", "env": {"API_TOKEN": "requester-token"}}
+        keys = [
+            _mcp_server_cache_key("shared", owner_config, "owner-sig"),
+            _mcp_server_cache_key("shared", requester_config, "requester-sig"),
+        ]
+
+        async def fake_register(name, cfg, *, cache_scope=None):
+            key = _mcp_server_cache_key(name, cfg, cache_scope)
+            server = _make_mock_server(name)
+            server._registered_tool_names = ["mcp_shared_lookup"]
+            _servers[key] = server
+            return ["mcp_shared_lookup"]
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=["mcp_shared_lookup"]):
+                assert register_mcp_servers({"shared": owner_config}, cache_scope="owner-sig") == [
+                    "mcp_shared_lookup"
+                ]
+                assert register_mcp_servers(
+                    {"shared": requester_config},
+                    cache_scope="requester-sig",
+                ) == ["mcp_shared_lookup"]
+
+            assert keys[0] in _servers
+            assert keys[1] in _servers
+            assert _servers[keys[0]] is not _servers[keys[1]]
+        finally:
+            for key in keys:
+                _servers.pop(key, None)
+
+    def test_mcp_handler_routes_to_current_principal_scoped_client(self):
+        from gateway.permissions import (
+            PermissionResolver,
+            reset_current_permission_context,
+            set_current_permission_context,
+        )
+        from tools.mcp_tool import (
+            _make_tool_handler,
+            _mcp_server_cache_key,
+            _servers,
+        )
+
+        def source(user_id: str):
+            return SimpleNamespace(
+                platform="telegram",
+                user_id=user_id,
+                user_id_alt=None,
+                user_name=user_id,
+                chat_type="dm",
+            )
+
+        config = {
+            "owners": {"owner": {"principals": ["telegram:owner"]}},
+            "principals": {
+                "telegram:employee": {
+                    "relationship": "coworker",
+                    "subject_owner": "owner",
+                }
+            },
+            "policies": {
+                "coworker": {"tools": {"allow": ["mcp_shared_lookup"]}},
+            },
+            "mcp_servers": {
+                "shared": {
+                    "command": "test",
+                    "env": {"API_TOKEN": "owner-token"},
+                    "credential_source": "requester",
+                    "requester_credentials": {
+                        "telegram:employee": {
+                            "env": {"API_TOKEN": "requester-token"},
+                        }
+                    },
+                }
+            },
+        }
+        resolver = PermissionResolver(config)
+        owner_ctx = resolver.resolve(source("owner"), session_key="owner")
+        requester_ctx = resolver.resolve(source("employee"), session_key="requester")
+        owner_config = owner_ctx.filter_mcp_servers(config["mcp_servers"])["shared"]
+        requester_config = requester_ctx.filter_mcp_servers(config["mcp_servers"])["shared"]
+        owner_key = _mcp_server_cache_key("shared", owner_config, owner_ctx.signature())
+        requester_key = _mcp_server_cache_key(
+            "shared",
+            requester_config,
+            requester_ctx.signature(),
+        )
+        owner_session = SimpleNamespace(
+            call_tool=AsyncMock(return_value=_make_call_result("owner result"))
+        )
+        requester_session = SimpleNamespace(
+            call_tool=AsyncMock(return_value=_make_call_result("requester result"))
+        )
+        _servers[owner_key] = _make_mock_server("shared", session=owner_session)
+        _servers[requester_key] = _make_mock_server("shared", session=requester_session)
+        handler = _make_tool_handler("shared", "lookup", 120)
+
+        try:
+            with patch("hermes_cli.config.load_config", return_value=config):
+                token = set_current_permission_context(owner_ctx)
+                try:
+                    owner_result = json.loads(handler({}))
+                finally:
+                    reset_current_permission_context(token)
+
+                token = set_current_permission_context(requester_ctx)
+                try:
+                    requester_result = json.loads(handler({}))
+                finally:
+                    reset_current_permission_context(token)
+
+            assert owner_result["result"] == "owner result"
+            assert requester_result["result"] == "requester result"
+            owner_session.call_tool.assert_awaited_once()
+            requester_session.call_tool.assert_awaited_once()
+        finally:
+            _servers.pop(owner_key, None)
+            _servers.pop(requester_key, None)
 
     def test_skips_disabled_servers(self):
         from tools.mcp_tool import register_mcp_servers, _servers

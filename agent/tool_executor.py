@@ -613,6 +613,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = json.dumps({"success": False, "error": format_session_db_unavailable()})
             else:
                 from tools.session_search_tool import session_search as _session_search
+                _policy_ctx = getattr(agent, "tool_policy_context", None)
                 function_result = _session_search(
                     query=function_args.get("query", ""),
                     role_filter=function_args.get("role_filter"),
@@ -623,6 +624,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     sort=function_args.get("sort"),
                     db=session_db,
                     current_session_id=agent.session_id,
+                    requester_user_id=getattr(agent, "_session_search_user_id", None),
+                    subject_owner_id=getattr(_policy_ctx, "session_search_subject_owner_id", None),
+                    visibility=getattr(_policy_ctx, "session_search_visibility", None),
+                    shared_visibility=getattr(_policy_ctx, "session_search_shared_visibility", None),
+                    permission_context=_policy_ctx,
                 )
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
@@ -751,6 +757,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    tool_policy_context=getattr(agent, "tool_policy_context", None),
                     skip_pre_tool_call_hook=True,
                 )
                 _spinner_result = function_result
@@ -771,6 +778,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call_id=tool_call.id,
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                    tool_policy_context=getattr(agent, "tool_policy_context", None),
                     skip_pre_tool_call_hook=True,
                 )
             except Exception as tool_error:

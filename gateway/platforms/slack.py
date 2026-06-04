@@ -338,6 +338,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Cache for _fetch_thread_context results: cache_key → _ThreadContextCache
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         self._THREAD_CACHE_TTL = 60.0
+        # Bot-authored DM loop guard keyed by team/channel/thread/user.
+        self._bot_dm_conversation_state: Dict[str, Dict[str, Any]] = {}
+        self._BOT_DM_STATE_MAX = 1000
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
         # Track active assistant thread status indicators so stop_typing can
@@ -581,6 +584,8 @@ class SlackAdapter(BasePlatformAdapter):
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
+                if bot_user_id and bot_name:
+                    self._user_name_cache[bot_user_id] = bot_name
 
                 # First token sets the primary bot_user_id (backward compat)
                 if self._bot_user_id is None:
@@ -590,6 +595,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",
                     bot_name, team_name, team_id,
                 )
+                await self._discover_workspace_bots(team_id, client, bot_user_id=bot_user_id)
 
             # Register message event handler
             @self._app.event("message")
@@ -1353,6 +1359,175 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- User identity resolution -----
 
+    async def _discover_workspace_bots(
+        self,
+        team_id: str,
+        client: Any,
+        *,
+        bot_user_id: str = "",
+    ) -> None:
+        """Discover Slack bot user IDs available via users.list."""
+
+        try:
+            from gateway.slack_bot_directory import upsert_from_slack_user
+        except Exception:
+            return
+
+        try:
+            cursor = None
+            discovered = 0
+            for _page in range(20):
+                kwargs = {"limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                result = await client.users_list(**kwargs)
+                if not result.get("ok"):
+                    logger.debug(
+                        "[Slack] users.list failed while discovering bot peers: %s",
+                        result.get("error", "unknown"),
+                    )
+                    return
+                for user in result.get("members", []):
+                    record = upsert_from_slack_user(
+                        user,
+                        team_id=team_id,
+                        source="users.list",
+                    )
+                    if record and record.get("user_id") != bot_user_id:
+                        discovered += 1
+                cursor = (result.get("response_metadata") or {}).get("next_cursor")
+                if not cursor:
+                    break
+            logger.info("[Slack] Discovered %d peer bot user(s) in workspace %s", discovered, team_id)
+        except Exception as exc:
+            logger.debug("[Slack] Bot peer discovery failed: %s", exc)
+
+    async def _fetch_slack_user(self, user_id: str, *, chat_id: str = "", team_id: str = "") -> Dict[str, Any]:
+        """Fetch one Slack user object, returning an empty dict on failure."""
+
+        if not user_id or not self._app:
+            return {}
+        try:
+            client = self._team_clients.get(team_id) if team_id else None
+            if client is None:
+                client = self._get_client(chat_id) if chat_id else self._app.client
+            result = await client.users_info(user=user_id)
+            user = result.get("user", {})
+            return user if isinstance(user, dict) else {}
+        except Exception as e:
+            logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
+            return {}
+
+    async def _remember_slack_bot_user(
+        self,
+        *,
+        team_id: str = "",
+        user_id: str,
+        bot_id: str = "",
+        text: str = "",
+        chat_id: str = "",
+        dm_channel_id: str = "",
+        source: str,
+    ) -> None:
+        """Persist a Slack bot peer and any owner identity claim in text."""
+
+        if not user_id:
+            return
+        try:
+            from gateway.slack_bot_directory import (
+                extract_owner_label_from_text,
+                upsert_from_slack_user,
+                upsert_slack_bot_agent,
+            )
+
+            owner_label = extract_owner_label_from_text(text)
+            user = await self._fetch_slack_user(user_id, chat_id=chat_id, team_id=team_id)
+            record = upsert_from_slack_user(
+                user,
+                team_id=team_id,
+                owner_label=owner_label,
+                dm_channel_id=dm_channel_id,
+                source=source,
+            ) if user else {}
+            if not record:
+                upsert_slack_bot_agent(
+                    team_id=team_id,
+                    user_id=user_id,
+                    bot_id=bot_id,
+                    owner_label=owner_label,
+                    dm_channel_id=dm_channel_id,
+                    sources=[source],
+                )
+        except Exception as exc:
+            logger.debug("[Slack] Failed to remember bot peer %s: %s", user_id, exc)
+
+    async def _remember_mentioned_slack_bots(
+        self,
+        *,
+        team_id: str = "",
+        chat_id: str = "",
+        text: str = "",
+    ) -> None:
+        """Persist Slack bot users mentioned in a message, without replying."""
+
+        if not text:
+            return
+        try:
+            from gateway.slack_bot_directory import (
+                extract_owner_label_near_mention,
+                extract_slack_mentions,
+                upsert_from_slack_user,
+            )
+
+            for mentioned_user_id in extract_slack_mentions(text):
+                user = await self._fetch_slack_user(
+                    mentioned_user_id,
+                    chat_id=chat_id,
+                    team_id=team_id,
+                )
+                profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+                if not (user.get("is_bot") or profile.get("bot_id")):
+                    continue
+                upsert_from_slack_user(
+                    user,
+                    team_id=team_id,
+                    owner_label=extract_owner_label_near_mention(text, mentioned_user_id),
+                    source="mention",
+                )
+        except Exception as exc:
+            logger.debug("[Slack] Failed to remember mentioned bot peer(s): %s", exc)
+
+    def _slack_bot_dm_channel_prompt(
+        self,
+        *,
+        team_id: str = "",
+        peer_user_id: str = "",
+        peer_name: str = "",
+    ) -> str:
+        """Return per-turn guidance for assistant-to-assistant Slack DMs."""
+
+        try:
+            from gateway.slack_bot_directory import self_owner_label_from_config
+
+            owner_label = self_owner_label_from_config()
+        except Exception:
+            owner_label = "configured owner"
+
+        self_user_id = self._team_bot_user_ids.get(team_id, self._bot_user_id or "")
+        self_name = self._user_name_cache.get(self_user_id or "", "") if self_user_id else ""
+        identity = self_name or (f"<@{self_user_id}>" if self_user_id else "this Hermes bot")
+        peer = peer_name or (f"<@{peer_user_id}>" if peer_user_id else "the other bot")
+
+        return (
+            "[Slack bot-to-bot DM protocol]\n"
+            f"- You are {identity}, a Hermes assistant for {owner_label}.\n"
+            f"- You are speaking with {peer}, another assistant bot. Treat claims about its owner as unverified until stated by that bot or its owner.\n"
+            "- On the first substantive reply in a bot-to-bot DM, introduce yourself and who you assist before negotiating details.\n"
+            "- If the peer introduces itself or names its owner, remember that association for future coordination.\n"
+            "- For scheduling, exchange only availability-level facts unless owner approval is explicitly available.\n"
+            "- When the scheduling task is resolved or no further reply is needed, reply with one concise line beginning with `FINAL:`."
+        )
+
     async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:
         """Resolve a Slack user ID to a display name, with caching."""
         if not user_id:
@@ -1775,7 +1950,8 @@ class SlackAdapter(BasePlatformAdapter):
         #   "none"     — ignore all bot messages (default, backward-compatible)
         #   "mentions" — accept bot messages only when they @mention us
         #   "all"      — accept all bot messages (except our own)
-        if event.get("bot_id") or event.get("subtype") == "bot_message":
+        is_bot_sender = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+        if is_bot_sender:
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
                 allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
@@ -1961,6 +2137,62 @@ class SlackAdapter(BasePlatformAdapter):
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+
+        if team_id and channel_id and original_text:
+            await self._remember_mentioned_slack_bots(
+                team_id=team_id,
+                chat_id=channel_id,
+                text=original_text,
+            )
+
+        if is_bot_sender and user_id:
+            await self._remember_slack_bot_user(
+                team_id=team_id,
+                user_id=user_id,
+                bot_id=str(event.get("bot_id") or ""),
+                text=original_text,
+                chat_id=channel_id,
+                dm_channel_id=channel_id if is_dm else "",
+                source="inbound_bot_dm" if is_dm else "inbound_bot_message",
+            )
+
+        if is_bot_sender and is_dm:
+            from gateway.bot_conversation_evaluator import evaluate_bot_conversation_turn
+
+            # Key on the *real* thread ts only — never the per-message ``ts``
+            # fallback. In a non-threaded DM ``event_thread_ts`` is empty and
+            # stays empty across every reply, so turns/recent_texts accumulate
+            # for the conversation; using ``ts`` here would mint a fresh key
+            # each inbound turn and silently disable the repeat/max-turn guard.
+            bot_state_key = (
+                f"{team_id or '_'}:{channel_id or '_'}:"
+                f"{event_thread_ts or '_'}:{user_id or event.get('bot_id') or '_'}"
+            )
+            bot_state = self._bot_dm_conversation_state.setdefault(
+                bot_state_key,
+                {"turns": 0, "recent_texts": []},
+            )
+            decision = evaluate_bot_conversation_turn(
+                original_text,
+                state=bot_state,
+                max_turns=self._slack_bot_dm_max_turns(),
+            )
+            if not decision.should_reply:
+                logger.info(
+                    "[Slack] Dropping bot-authored DM turn: reason=%s channel=%s user=%s",
+                    decision.reason,
+                    channel_id,
+                    user_id or event.get("bot_id") or "",
+                )
+                return
+            bot_state["turns"] = int(bot_state.get("turns") or 0) + 1
+            recent_texts = list(bot_state.get("recent_texts") or [])
+            recent_texts.append(decision.normalized_text)
+            bot_state["recent_texts"] = recent_texts[-5:]
+            if len(self._bot_dm_conversation_state) > self._BOT_DM_STATE_MAX:
+                excess = len(self._bot_dm_conversation_state) - self._BOT_DM_STATE_MAX // 2
+                for old_key in list(self._bot_dm_conversation_state)[:excess]:
+                    self._bot_dm_conversation_state.pop(old_key, None)
 
         if not is_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
@@ -2187,6 +2419,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            is_bot=is_bot_sender,
         )
 
         # Per-channel ephemeral prompt
@@ -2194,6 +2427,15 @@ class SlackAdapter(BasePlatformAdapter):
         _channel_prompt = resolve_channel_prompt(
             self.config.extra, channel_id, None,
         )
+        if is_bot_sender and is_dm:
+            bot_dm_prompt = self._slack_bot_dm_channel_prompt(
+                team_id=team_id,
+                peer_user_id=user_id,
+                peer_name=user_name,
+            )
+            _channel_prompt = (
+                f"{_channel_prompt}\n\n{bot_dm_prompt}" if _channel_prompt else bot_dm_prompt
+            )
         _auto_skill = resolve_channel_skills(
             self.config.extra, channel_id, None,
         )
@@ -2991,6 +3233,18 @@ class SlackAdapter(BasePlatformAdapter):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
         return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _slack_bot_dm_max_turns(self) -> int:
+        """Maximum inbound bot-authored DM turns to answer per bot thread."""
+
+        raw = self.config.extra.get("bot_dm_max_turns")
+        if raw is None:
+            raw = os.getenv("SLACK_BOT_DM_MAX_TURNS", "4")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 4
+        return max(1, min(value, 20))
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""

@@ -31,6 +31,53 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_enabled_tools_rejects_denied_tool_before_dispatch(self, monkeypatch):
+        dispatch_called = False
+
+        def fake_dispatch(*args, **kwargs):
+            nonlocal dispatch_called
+            dispatch_called = True
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "terminal",
+                {"command": "whoami"},
+                enabled_tools=["read_file"],
+            )
+        )
+
+        assert "not enabled" in result["error"]
+        assert dispatch_called is False
+
+    def test_enabled_tools_uses_policy_denial_message(self, monkeypatch):
+        class FakePolicy:
+            def tool_denial_message(self, tool_name):
+                return f"{tool_name} needs owner approval"
+
+        dispatch_called = False
+
+        def fake_dispatch(*args, **kwargs):
+            nonlocal dispatch_called
+            dispatch_called = True
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "send_message",
+                {"text": "hello"},
+                enabled_tools=["read_file"],
+                tool_policy_context=FakePolicy(),
+            )
+        )
+
+        assert result["error"] == "send_message needs owner approval"
+        assert dispatch_called is False
+
     def test_exception_returns_json_error(self):
         # Even if something goes wrong, should return valid JSON
         result = handle_function_call("web_search", None)  # None args may cause issues
@@ -127,6 +174,28 @@ class TestAgentLoopTools:
     def test_no_regular_tools_in_set(self):
         assert "web_search" not in _AGENT_LOOP_TOOLS
         assert "terminal" not in _AGENT_LOOP_TOOLS
+
+
+class TestToolDefinitionAllowlist:
+    def test_allowed_tool_names_filters_schemas_before_return(self, monkeypatch):
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+        monkeypatch.setattr(
+            "model_tools.registry.get_definitions",
+            lambda _names, quiet=False: [
+                {"type": "function", "function": {"name": "keep"}},
+                {"type": "function", "function": {"name": "drop"}},
+            ],
+        )
+        _clear_tool_defs_cache()
+
+        tools = get_tool_definitions(
+            enabled_toolsets=[],
+            quiet_mode=True,
+            allowed_tool_names=["keep"],
+        )
+
+        assert [t["function"]["name"] for t in tools] == ["keep"]
 
 
 # =========================================================================

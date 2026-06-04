@@ -13,7 +13,8 @@ import re
 import ssl
 import time
 from email.utils import formatdate
-from typing import Dict, Optional
+from fnmatch import fnmatchcase
+from typing import Any, Dict, Mapping, Optional
 
 from agent.redact import redact_sensitive_text
 
@@ -135,7 +136,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'slack:@peerbot (bot)', 'slack:U012BOTUSER' for Slack bot DMs, 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -154,7 +155,7 @@ def send_message_tool(args, **kw):
     if action == "list":
         return _handle_list()
 
-    return _handle_send(args)
+    return _handle_send(args, owner_approved=bool(kw.get("owner_approved", False)))
 
 
 def _handle_list():
@@ -166,12 +167,127 @@ def _handle_list():
         return json.dumps(_error(f"Failed to load channel directory: {e}"))
 
 
-def _handle_send(args):
+def _policy_context():
+    try:
+        from gateway.permissions import get_current_permission_context
+
+        return get_current_permission_context()
+    except Exception:
+        return None
+
+
+def _messaging_resource_rules(permission_context: Any = None) -> Mapping[str, Any]:
+    ctx = permission_context if permission_context is not None else _policy_context()
+    rules = getattr(ctx, "resource_rules", {}) if ctx is not None else {}
+    if not isinstance(rules, Mapping):
+        return {}
+    for key in ("messaging", "messages", "send_message"):
+        value = rules.get(key)
+        if isinstance(value, Mapping):
+            return value
+        if isinstance(value, str):
+            return {"send": value}
+    return {}
+
+
+def _as_rule_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list | tuple | set):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)]
+
+
+def _messaging_send_allowed(target: str, *, permission_context: Any = None) -> bool:
+    ctx = permission_context if permission_context is not None else _policy_context()
+    if ctx is None:
+        return True
+    if bool(getattr(ctx, "is_owner", False)):
+        return True
+
+    rules = _messaging_resource_rules(ctx)
+    decision = rules.get("send", rules.get("write", rules.get("respond_on_behalf")))
+    if isinstance(decision, bool):
+        allowed = decision
+    else:
+        allowed = str(decision or "").strip().lower() in {"allow", "allowed", "auto", "respond"}
+    if not allowed:
+        return False
+
+    target_rules = (
+        rules.get("targets")
+        or rules.get("allow_targets")
+        or rules.get("allowed_targets")
+        or rules.get("send_targets")
+    )
+    patterns = _as_rule_list(target_rules)
+    if not patterns:
+        return True
+    return any(fnmatchcase(str(target), pattern) for pattern in patterns)
+
+
+def create_send_message_approval_result(
+    args: Mapping[str, Any],
+    *,
+    permission_context: Any = None,
+) -> str:
+    """Create a durable owner approval request for a held outbound message."""
+
+    ctx = permission_context if permission_context is not None else _policy_context()
+    target = str(args.get("target") or "").strip()
+    message = str(args.get("message") or "").strip()
+    if not target or not message:
+        return tool_error("Both 'target' and 'message' are required for owner approval.")
+    if ctx is None:
+        return tool_error("Owner approval is unavailable because no policy context is bound.")
+
+    requester = getattr(getattr(ctx, "requester", None), "key", "unknown")
+    owner_id = str(getattr(ctx, "subject_owner_id", "") or "unresolved")
+    try:
+        from gateway.owner_approvals import create_approval_request
+
+        request = create_approval_request(
+            action_type="send_message",
+            payload={
+                "target": target,
+                "message": message,
+                "owner_id": owner_id,
+            },
+            risk="medium",
+            summary=f"Send message to {target}",
+            requester=requester,
+            subject_owner_id=owner_id,
+            requester_context={
+                "platform": str(getattr(ctx, "platform", "") or ""),
+                "relationship": str(getattr(ctx, "relationship", "") or ""),
+                "policy_name": str(getattr(ctx, "policy_name", "") or ""),
+                "session_key": str(getattr(ctx, "session_key", "") or ""),
+            },
+        )
+    except Exception as exc:
+        return json.dumps(_error(f"Failed to create owner approval request: {exc}"))
+
+    return json.dumps({
+        "success": True,
+        "approval_required": True,
+        "approval_request_id": request["id"],
+        "status": request["status"],
+        "external_effect": "none",
+        "message": "Message saved for owner approval. No outbound message was sent.",
+    }, ensure_ascii=False)
+
+
+def _handle_send(args, *, owner_approved: bool = False):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    if not owner_approved and not _messaging_send_allowed(str(target)):
+        return create_send_message_approval_result(args)
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
@@ -276,27 +392,45 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
-    # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
+    # Slack: resolve human user IDs (U...) to DM channel IDs via
+    # conversations.open. Bot users are different: Slack rejects
+    # conversations.open with cannot_dm_bot, but chat.postMessage can address
+    # the bot user ID directly and Slack returns/creates the D... IM channel.
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
-            import aiohttp
-            async def _open_slack_dm(token, user_id):
-                url = "https://slack.com/api/conversations.open"
-                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                    async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:
-                        data = await resp.json()
-                        if data.get("ok"):
-                            return data["channel"]["id"]
-                        return None
-            from model_tools import _run_async
-            dm_channel = _run_async(_open_slack_dm(pconfig.token, chat_id))
-            if dm_channel:
-                chat_id = dm_channel
-            else:
-                return json.dumps({"error": f"Could not open DM with Slack user {chat_id}. Check bot permissions (im:write)."})
-        except Exception as e:
-            return json.dumps({"error": f"Failed to open Slack DM: {e}"})
+            from gateway.slack_bot_directory import known_slack_bot_agents
+
+            known_bot_ids = {
+                str(bot.get("user_id") or "")
+                for bot in known_slack_bot_agents(include_deleted=False)
+            }
+        except Exception:
+            known_bot_ids = set()
+
+        if chat_id not in known_bot_ids:
+            try:
+                import aiohttp
+                async def _open_slack_dm(token, user_id):
+                    url = "https://slack.com/api/conversations.open"
+                    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                        async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:
+                            data = await resp.json()
+                            if data.get("ok"):
+                                return data["channel"]["id"], ""
+                            return None, str(data.get("error") or "unknown")
+                from model_tools import _run_async
+                dm_channel, open_error = _run_async(_open_slack_dm(pconfig.token, chat_id))
+                if dm_channel:
+                    chat_id = dm_channel
+                elif open_error == "cannot_dm_bot":
+                    # Fall through: chat.postMessage(channel=U...) is the
+                    # supported bot-to-bot DM addressing path.
+                    pass
+                else:
+                    return json.dumps({"error": f"Could not open DM with Slack user {chat_id}. Slack error: {open_error}. Check bot permissions (im:write)."})
+            except Exception as e:
+                return json.dumps({"error": f"Failed to open Slack DM: {e}"})
 
     try:
         from model_tools import _run_async
@@ -321,9 +455,15 @@ def _handle_send(args):
                 from gateway.session_context import get_session_env
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                # Prefer the channel the platform actually delivered to. For
+                # Slack bot-to-bot DMs, _send_slack() resolves the U... target
+                # to the real D... DM channel and returns it in result["chat_id"];
+                # mirroring to the pre-send chat_id would miss the recipient
+                # transcript and lose context on subsequent turns.
+                mirror_chat_id = result.get("chat_id") or chat_id
                 if mirror_to_session(
                     platform_name,
-                    chat_id,
+                    mirror_chat_id,
                     mirror_text,
                     source_label=source_label,
                     thread_id=thread_id,
@@ -1051,7 +1191,13 @@ async def _send_slack(token, chat_id, message):
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):
-                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
+                    return {
+                        "success": True,
+                        "platform": "slack",
+                        "chat_id": data.get("channel") or chat_id,
+                        "requested_chat_id": chat_id,
+                        "message_id": data.get("ts"),
+                    }
                 return _error(f"Slack API error: {data.get('error', 'unknown')}")
     except Exception as e:
         return _error(f"Slack send failed: {e}")
